@@ -269,7 +269,9 @@ async def handle_document(client: Client, message: Message):
                 if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
                     link, aes_key = parts
             elif "*" in link:
-                link, aes_key = link.split("*", 1)
+                parts = link.rsplit("*", 1)
+                if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
+                    link, aes_key = parts
 
             def sync_pdf_dl(actual_link):
                 try:
@@ -346,7 +348,9 @@ async def handle_document(client: Client, message: Message):
                 if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
                     link, aes_key = parts
             elif "*" in link:
-                link, aes_key = link.split("*", 1)
+                parts = link.rsplit("*", 1)
+                if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
+                    link, aes_key = parts
             
             success = await download_m3u8(link, mp4_path, base_url)
             
