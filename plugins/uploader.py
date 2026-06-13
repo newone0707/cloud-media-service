@@ -70,7 +70,29 @@ async def download_m3u8(url, output_path, base_url):
             try:
                 import urllib.parse
                 import re
+                import requests
                 
+                nonlocal url
+                # Re-sign the URL to bypass IP-pinned 403 Forbidden
+                base_url_for_signing = url.split("?")[0]
+                token_match = re.search(r"token=([^&]+)", url)
+                if token_match:
+                    token_val = token_match.group(1)
+                    cp_headers = {
+                        'host': 'api.classplusapp.com',
+                        'x-access-token': token_val,
+                        'accept-language': 'EN',
+                        'api-version': '18',
+                        'app-version': '1.4.73.2',
+                        'user-agent': 'Mobile-Android',
+                    }
+                    signed_api = f"https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={base_url_for_signing}"
+                    resp = requests.get(signed_api, headers=cp_headers)
+                    if resp.status_code == 200:
+                        res_json = resp.json()
+                        if "url" in res_json:
+                            url = res_json["url"] # Update the url to the newly signed one
+
                 r = requests.get(url, headers=headers)
                 r.raise_for_status()
                 master_text = r.text
