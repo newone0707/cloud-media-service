@@ -1,0 +1,304 @@
+import os
+import time
+import asyncio
+import yt_dlp
+import requests
+from curl_cffi import requests as cffi_requests
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from utils import progress_bar, decrypt_file
+
+# Global state to track uploads and stop requests
+upload_states = {}
+
+import asyncio
+
+def sync_download(url, output_path, referer):
+    try:
+        r = cffi_requests.get(url, stream=True, impersonate='chrome', headers={'User-Agent': 'Mozilla/5.0', 'Referer': referer, 'Origin': referer})
+        r.raise_for_status()
+        with open(output_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return True
+    except Exception as e:
+        with open('debug.log', 'a') as debug_f:
+            debug_f.write(f"Direct Download Error: {e}\n")
+        print(f"Direct Download Error: {e}")
+        return False
+
+async def download_m3u8(url, output_path, base_url):
+    print(f"Downloading URL: {url}")
+    referer = base_url if base_url.endswith('/') else base_url + '/'
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Referer': referer,
+        'Origin': referer,
+        'device-id': '39F093FF35F201D9'
+    }
+    if "token=" in url:
+        token = url.split("token=")[1].split("&")[0]
+        headers['x-access-token'] = token
+        headers['api-version'] = "18"
+        try:
+            import base64
+            import json
+            payload = token.split(".")[1]
+            padded = payload + "=" * ((4 - len(payload) % 4) % 4)
+            jwt_data = json.loads(base64.b64decode(padded).decode("utf-8"))
+            if "fingerprintId" in jwt_data:
+                headers['device-id'] = jwt_data["fingerprintId"]
+            else:
+                headers['User-Agent'] = 'Mobile-Android'
+                headers['app-version'] = '1.4.65.3'
+        except:
+            pass
+    elif "appx" in url or "encrypted" in url:
+        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        if "appx" in referer:
+            headers['Referer'] = referer
+            headers['Origin'] = referer
+
+    if "encrypted.mkv" in url:
+        # Download directly via requests for encrypted MKV (in background thread)
+        return await asyncio.to_thread(sync_download, url, output_path, referer)
+    
+    ydl_opts = {
+        'format': 'best',
+        'outtmpl': output_path,
+        'quiet': False,
+        'no_warnings': False,
+        'http_headers': headers,
+        'impersonate': 'chrome'
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ret = ydl.download([url])
+            return ret == 0
+    except Exception as e:
+        print(f"YT-DLP Error: {e}")
+        return False
+
+@Client.on_message(filters.command("stop") & filters.private)
+async def stop_cmd(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in upload_states and upload_states[user_id].get("is_uploading"):
+        upload_states[user_id]["stop_requested"] = True
+        await message.reply_text("🛑 **Stop requested! The process will halt after the current file finishes.**")
+    else:
+        await message.reply_text("❌ **No upload process is currently running.**")
+
+@Client.on_message(filters.command("upload") & filters.private)
+async def upload_cmd(client: Client, message: Message):
+    user_id = message.from_user.id
+    
+    parts = message.text.split(" ")
+    limit = 0
+    if len(parts) > 1:
+        if parts[1].isdigit():
+            limit = int(parts[1])
+        elif parts[1].lower() == "all":
+            limit = -1
+        else:
+            await message.reply_text("❌ **Usage:** `/upload [count]` or `/upload all`")
+            return
+    else:
+        await message.reply_text("❌ **Usage:** `/upload [count]` or `/upload all`")
+        return
+        
+    upload_states[user_id] = {
+        "waiting_for_file": True,
+        "limit": limit,
+        "is_uploading": False,
+        "stop_requested": False
+    }
+    
+    await message.reply_text(f"✅ **Ready to upload {limit if limit > 0 else 'ALL'} links!**\n\n📄 **Please send me the `.txt` file containing the extracted links now.**")
+
+@Client.on_message(filters.document & filters.private)
+async def handle_document(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in upload_states or not upload_states[user_id].get("waiting_for_file"):
+        return
+        
+    doc = message.document
+    if not doc.file_name.endswith('.txt'):
+        await message.reply_text("❌ **Please send a valid `.txt` file.**")
+        return
+        
+    state = upload_states[user_id]
+    state["waiting_for_file"] = False
+    state["is_uploading"] = True
+    state["stop_requested"] = False
+    limit = state["limit"]
+    
+    status_msg = await message.reply_text("⏳ **Downloading and parsing your file...**")
+    file_data = await message.download(in_memory=True)
+    
+    try:
+        content = file_data.getvalue().decode("utf-8")
+        lines = content.splitlines(True)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ **Failed to read file:** {e}")
+        state["is_uploading"] = False
+        return
+    finally:
+        pass
+
+    links_to_upload = []
+    base_url = "https://web.classplusapp.com/"
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("Course:"):
+            continue
+        if line.startswith("BaseURL:"):
+            base_url = line.split("BaseURL:")[1].strip()
+            continue
+        if ": " in line:
+            name, link = line.split(": ", 1)
+            if link.startswith("http"):
+                links_to_upload.append({"name": name.strip(), "link": link.strip()})
+        elif line.startswith("http"):
+             links_to_upload.append({"name": "Video", "link": line.strip()})
+
+    if limit > 0:
+        links_to_upload = links_to_upload[:limit]
+
+    if not links_to_upload:
+        await status_msg.edit_text("❌ **No valid links found in the file.**")
+        state["is_uploading"] = False
+        return
+
+    await status_msg.edit_text(f"🚀 **Found {len(links_to_upload)} links. Starting upload process...**\n\n*(Send /stop anytime to halt)*")
+
+    uploaded_count = 0
+    for i, item in enumerate(links_to_upload):
+        if state["stop_requested"]:
+            await message.reply_text("🛑 **Process stopped by user!**")
+            break
+            
+        name = item["name"]
+        link = item["link"]
+        prog_msg = await message.reply_text(f"⏳ **Processing {i+1}/{len(links_to_upload)}:**\n`{name}`")
+        
+        if ".pdf" in link.lower() or "pdf" in name.lower():
+            # Download PDF
+            await prog_msg.edit_text(f"⏳ **Downloading PDF:**\n`{name}`")
+            pdf_path = f"{name}.pdf"
+            import re
+            pdf_path = re.sub(r'[\\/*?:"<>|]', '_', pdf_path) # sanitize
+            def sync_pdf_dl():
+                try:
+                    h = {'User-Agent': 'Mozilla/5.0', 'device-id': '39F093FF35F201D9'}
+                    if "token=" in link:
+                        token = link.split("token=")[1].split("&")[0]
+                        h['x-access-token'] = token
+                        h['api-version'] = "18"
+                        try:
+                            import base64
+                            import json
+                            payload = token.split(".")[1]
+                            padded = payload + "=" * ((4 - len(payload) % 4) % 4)
+                            jwt_data = json.loads(base64.b64decode(padded).decode("utf-8"))
+                            if "fingerprintId" in jwt_data:
+                                h['device-id'] = jwt_data["fingerprintId"]
+                            else:
+                                h['User-Agent'] = 'Mobile-Android'
+                                h['app-version'] = '1.4.65.3'
+                        except:
+                            pass
+                    r = cffi_requests.get(link, stream=True, impersonate='chrome', headers=h)
+                    r.raise_for_status()
+                    with open(pdf_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    return True
+                except Exception as e:
+                    with open('debug.log', 'a') as debug_f:
+                        debug_f.write(f"PDF Download Error: {e}\n")
+                    print(f"PDF Download Error: {e}")
+                    return False
+            success = await asyncio.to_thread(sync_pdf_dl)
+            
+            if state["stop_requested"]:
+                break
+                
+            if success:
+                start_time = time.time()
+                try:
+                    await client.send_document(
+                        chat_id=message.chat.id,
+                        document=pdf_path,
+                        caption=f"📄 **{name}**",
+                        progress=progress_bar,
+                        progress_args=(prog_msg, start_time)
+                    )
+                    await prog_msg.delete()
+                    uploaded_count += 1
+                except Exception as e:
+                    with open('debug.log', 'a') as debug_f:
+                        debug_f.write(f"Upload Error: {e}\n")
+                    await prog_msg.edit_text(f"❌ **Failed to upload PDF:**\n`{e}`")
+            else:
+                await prog_msg.edit_text(f"❌ **Failed to download PDF:**\n`{name}`")
+            
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        else:
+            # Download Video
+            await prog_msg.edit_text(f"⏳ **Downloading Video (This may take a while):**\n`{name}`")
+            import re
+            mp4_path = f"{name}.mp4"
+            mp4_path = re.sub(r'[\\/*?:"<>|]', '_', mp4_path)
+            
+            aes_key = None
+            if "*" in link:
+                link, aes_key = link.split("*", 1)
+            
+            success = await download_m3u8(link, mp4_path, base_url)
+            
+            if success and aes_key and os.path.exists(mp4_path):
+                await prog_msg.edit_text(f"⏳ **Decrypting Video...**\n`{name}`")
+                decrypted = decrypt_file(mp4_path, aes_key)
+                if not decrypted:
+                    success = False
+            
+            if state["stop_requested"]:
+                if os.path.exists(mp4_path):
+                    os.remove(mp4_path)
+                break
+                
+            if success and os.path.exists(mp4_path):
+                start_time = time.time()
+                try:
+                    parts = [p.strip() for p in name.split(">")]
+                    video_title = parts[-1]
+                    topic_name = parts[-2] if len(parts) > 1 else "Home"
+                    batch_name = parts[1] if len(parts) > 2 else (parts[0] if len(parts) > 0 else "Unknown")
+                    vid_id = f"{i+1:03d}"
+                    
+                    custom_caption = f"""[🎥] **Vid Id** : `{vid_id}`\n**Video Title** : `{video_title}`\n**Topic Name** : `{topic_name}`\n**Batch Name** : `{batch_name}`\n\n**Extracted By** ➢ Clean Leach Bot"""
+                    
+                    await client.send_video(
+                        chat_id=message.chat.id,
+                        video=mp4_path,
+                        caption=custom_caption,
+                        supports_streaming=True,
+                        progress=progress_bar,
+                        progress_args=(prog_msg, start_time)
+                    )
+                    await prog_msg.delete()
+                    uploaded_count += 1
+                except Exception as e:
+                    with open('debug.log', 'a') as debug_f:
+                        debug_f.write(f"Video Upload Error: {e}\n")
+                    await prog_msg.edit_text(f"❌ **Failed to upload:**\n`{e}`")
+                finally:
+                    if os.path.exists(mp4_path):
+                        os.remove(mp4_path)
+            else:
+                await prog_msg.edit_text(f"❌ **Failed to download Video:**\n`{name}`")
+
+    state["is_uploading"] = False
+    await message.reply_text(f"✅ **Finished! Successfully processed {uploaded_count} files.**")
