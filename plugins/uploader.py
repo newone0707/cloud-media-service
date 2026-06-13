@@ -65,6 +65,79 @@ async def download_m3u8(url, output_path, base_url):
         # Download directly via requests for direct files (in background thread)
         return await asyncio.to_thread(sync_download, url, output_path, referer)
     
+    if "classplus" in url and "token=" in url:
+        def sync_classplus_dl():
+            try:
+                import urllib.parse
+                import re
+                
+                r = cffi_requests.get(url, headers=headers, impersonate='chrome')
+                r.raise_for_status()
+                master_text = r.text
+                
+                base_url_hls = url.split("?")[0].rsplit("/", 1)[0] + "/"
+                query_params = "?" + url.split("?")[1] if "?" in url else ""
+                
+                max_bw = 0
+                best_res_url = None
+                lines = master_text.splitlines()
+                for j, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF"):
+                        bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+                        bw = int(bw_match.group(1)) if bw_match else 0
+                        if bw >= max_bw:
+                            max_bw = bw
+                            best_res_url = lines[j+1].strip()
+                
+                if best_res_url:
+                    if not best_res_url.startswith("http"):
+                        best_res_url = urllib.parse.urljoin(base_url_hls, best_res_url)
+                    r2 = cffi_requests.get(best_res_url + query_params, headers=headers, impersonate='chrome')
+                    r2.raise_for_status()
+                    sub_text = r2.text
+                    base_url_hls = best_res_url.split("?")[0].rsplit("/", 1)[0] + "/"
+                else:
+                    sub_text = master_text
+                    
+                new_lines = []
+                for line in sub_text.splitlines():
+                    if line.startswith("#EXT-X-KEY"):
+                        uri_match = re.search(r'URI="([^"]+)"', line)
+                        if uri_match:
+                            uri = uri_match.group(1)
+                            abs_uri = urllib.parse.urljoin(base_url_hls, uri) if not uri.startswith("http") else uri
+                            line = line.replace(f'URI="{uri}"', f'URI="{abs_uri}{query_params}"')
+                        new_lines.append(line)
+                    elif line and not line.startswith("#"):
+                        abs_line = urllib.parse.urljoin(base_url_hls, line) if not line.startswith("http") else line
+                        new_lines.append(abs_line + query_params)
+                    else:
+                        new_lines.append(line)
+                        
+                local_m3u8 = output_path + ".m3u8"
+                with open(local_m3u8, "w") as f:
+                    f.write("\n".join(new_lines))
+                    
+                ydl_opts_local = {
+                    'format': 'best',
+                    'outtmpl': output_path,
+                    'quiet': False,
+                    'no_warnings': False,
+                    'http_headers': headers
+                }
+                with yt_dlp.YoutubeDL(ydl_opts_local) as ydl:
+                    ret = ydl.download([local_m3u8])
+                    
+                if os.path.exists(local_m3u8):
+                    os.remove(local_m3u8)
+                    
+                return ret == 0
+            except Exception as e:
+                import traceback
+                print(f"Classplus Custom DL Error:\n{traceback.format_exc()}")
+                return False
+        return await asyncio.to_thread(sync_classplus_dl)
+
     ydl_opts = {
         'format': 'best',
         'outtmpl': output_path,
