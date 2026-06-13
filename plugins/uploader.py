@@ -14,6 +14,7 @@ upload_states = {}
 import asyncio
 
 def sync_download(url, output_path, referer):
+    print(f"DEBUG sync_download URL: {url}")
     try:
         r = cffi_requests.get(url, stream=True, impersonate='chrome', headers={'User-Agent': 'Mozilla/5.0', 'Referer': referer, 'Origin': referer})
         r.raise_for_status()
@@ -60,8 +61,8 @@ async def download_m3u8(url, output_path, base_url):
             headers['Referer'] = referer
             headers['Origin'] = referer
 
-    if "encrypted.mkv" in url:
-        # Download directly via requests for encrypted MKV (in background thread)
+    if "encrypted.mkv" in url or "encrypted.mp4" in url or ".zip" in url or "appx" in url:
+        # Download directly via requests for direct files (in background thread)
         return await asyncio.to_thread(sync_download, url, output_path, referer)
     
     ydl_opts = {
@@ -69,15 +70,15 @@ async def download_m3u8(url, output_path, base_url):
         'outtmpl': output_path,
         'quiet': False,
         'no_warnings': False,
-        'http_headers': headers,
-        'impersonate': 'chrome'
+        'http_headers': headers
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ret = ydl.download([url])
             return ret == 0
     except Exception as e:
-        print(f"YT-DLP Error: {e}")
+        import traceback
+        print(f"YT-DLP Error:\n{traceback.format_exc()}")
         return False
 
 @Client.on_message(filters.command("stop") & filters.private)
@@ -253,7 +254,11 @@ async def handle_document(client: Client, message: Message):
             mp4_path = re.sub(r'[\\/*?:"<>|]', '_', mp4_path)
             
             aes_key = None
-            if "*" in link:
+            if ":Zm" in link or ":" in link.split("/")[-1]: # Appx AES keys often start with Zm or are appended with :
+                parts = link.rsplit(":", 1)
+                if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
+                    link, aes_key = parts
+            elif "*" in link:
                 link, aes_key = link.split("*", 1)
             
             success = await download_m3u8(link, mp4_path, base_url)
