@@ -189,10 +189,19 @@ async def handle_document(client: Client, message: Message):
             pdf_path = f"{name}.pdf"
             import re
             pdf_path = re.sub(r'[\\/*?:"<>|]', '_', pdf_path) # sanitize
-            def sync_pdf_dl():
+            
+            aes_key = None
+            if ":Zm" in link or ":" in link.split("/")[-1]:
+                parts = link.rsplit(":", 1)
+                if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
+                    link, aes_key = parts
+            elif "*" in link:
+                link, aes_key = link.split("*", 1)
+
+            def sync_pdf_dl(actual_link):
                 try:
                     h = {'User-Agent': 'Mozilla/5.0', 'device-id': '39F093FF35F201D9'}
-                    if "token=" in link:
+                    if "token=" in actual_link:
                         token = link.split("token=")[1].split("&")[0]
                         h['x-access-token'] = token
                         h['api-version'] = "18"
@@ -209,7 +218,7 @@ async def handle_document(client: Client, message: Message):
                                 h['app-version'] = '1.4.65.3'
                         except:
                             pass
-                    r = cffi_requests.get(link, stream=True, impersonate='chrome', headers=h)
+                    r = cffi_requests.get(actual_link, stream=True, impersonate='chrome', headers=h)
                     r.raise_for_status()
                     with open(pdf_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=8192):
@@ -220,8 +229,13 @@ async def handle_document(client: Client, message: Message):
                         debug_f.write(f"PDF Download Error: {e}\n")
                     print(f"PDF Download Error: {e}")
                     return False
-            success = await asyncio.to_thread(sync_pdf_dl)
+            success = await asyncio.to_thread(sync_pdf_dl, link)
             
+            if success and aes_key and os.path.exists(pdf_path):
+                decrypted = decrypt_file(pdf_path, aes_key)
+                if not decrypted:
+                    success = False
+
             if state["stop_requested"]:
                 break
                 
@@ -285,14 +299,40 @@ async def handle_document(client: Client, message: Message):
                     
                     custom_caption = f"""[🎥] **Vid Id** : `{vid_id}`\n**Video Title** : `{video_title}`\n**Topic Name** : `{topic_name}`\n**Batch Name** : `{batch_name}`\n\n**Extracted By** ➢ Clean Leach Bot"""
                     
+                    # Extract Metadata
+                    thumb_path = f"{mp4_path}.jpg"
+                    duration, width, height = 0, 0, 0
+                    try:
+                        import subprocess, json
+                        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", mp4_path]
+                        res = await asyncio.to_thread(subprocess.check_output, cmd, stderr=subprocess.STDOUT)
+                        meta = json.loads(res.decode("utf-8"))
+                        duration = int(float(meta.get("format", {}).get("duration", 0)))
+                        for stream in meta.get("streams", []):
+                            if stream.get("codec_type") == "video":
+                                width = int(stream.get("width", 0))
+                                height = int(stream.get("height", 0))
+                                break
+                        thumb_cmd = ["ffmpeg", "-y", "-i", mp4_path, "-ss", "00:00:02.000", "-vframes", "1", thumb_path]
+                        await asyncio.to_thread(subprocess.check_output, thumb_cmd, stderr=subprocess.STDOUT)
+                        if not os.path.exists(thumb_path): thumb_path = None
+                    except:
+                        thumb_path = None
+                    
                     await client.send_video(
                         chat_id=message.chat.id,
                         video=mp4_path,
                         caption=custom_caption,
                         supports_streaming=True,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        thumb=thumb_path,
                         progress=progress_bar,
                         progress_args=(prog_msg, start_time)
                     )
+                    if thumb_path and os.path.exists(thumb_path):
+                        os.remove(thumb_path)
                     await prog_msg.delete()
                     uploaded_count += 1
                 except Exception as e:
