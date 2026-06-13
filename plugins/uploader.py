@@ -16,7 +16,7 @@ import asyncio
 def sync_download(url, output_path, referer):
     print(f"DEBUG sync_download URL: {url}")
     try:
-        r = cffi_requests.get(url, stream=True, impersonate='chrome', headers={'User-Agent': 'Mozilla/5.0', 'Referer': referer, 'Origin': referer})
+        r = cffi_requests.get(url, stream=True, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': referer, 'Origin': referer})
         r.raise_for_status()
         with open(output_path, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192):
@@ -71,7 +71,7 @@ async def download_m3u8(url, output_path, base_url):
                 import urllib.parse
                 import re
                 
-                r = cffi_requests.get(url, headers=headers, impersonate='chrome')
+                r = requests.get(url, headers=headers)
                 r.raise_for_status()
                 master_text = r.text
                 
@@ -293,7 +293,7 @@ async def handle_document(client: Client, message: Message):
                                 h['app-version'] = '1.4.65.3'
                         except:
                             pass
-                    r = cffi_requests.get(actual_link, stream=True, impersonate='chrome', headers=h)
+                    r = cffi_requests.get(actual_link, stream=True, headers=h)
                     r.raise_for_status()
                     with open(pdf_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=8192):
