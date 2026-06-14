@@ -81,7 +81,7 @@ async def download_m3u8(url, output_path, base_url, user_id=None):
             except Exception as e:
                 with open('debug.log', 'a') as f: f.write(f"JW Logic Error: {e}\n")
 
-if "token=" in url:
+    if "token=" in url:
         token = url.split("token=")[1].split("&")[0]
         headers['x-access-token'] = token
         headers['api-version'] = "18"
