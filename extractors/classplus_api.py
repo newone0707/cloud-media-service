@@ -70,11 +70,12 @@ class ClassplusClient:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def get_signed_url(self, file_url, content_id):
+    def get_signed_url(self, file_url, content_id, course_id, folder_id):
         if not file_url:
             return ""
         if content_id and any(x in file_url for x in ["classplusapp.com", "tencdn.classplusapp", "videos.classplusapp", "media-cdn"]):
-            return f"{file_url}?contentId={content_id}&token={self.token}"
+            f_id = folder_id if folder_id else 0
+            return f"{file_url}?contentId={content_id}&courseId={course_id}&folderId={f_id}&token={self.token}"
         return file_url
 
     def extract_links(self, course_id):
@@ -101,7 +102,7 @@ class ClassplusClient:
                             if c_type == 2:
                                 self.total_videos += 1
                                 content_id = item.get("id")
-                                file_url = self.get_signed_url(file_url, content_id)
+                                file_url = self.get_signed_url(file_url, content_id, course_id, folder_id)
                             elif c_type == 3:
                                 self.total_pdfs += 1
                             links.append(f"{path}{name}: {file_url}")
@@ -121,7 +122,7 @@ class ClassplusClient:
                 if video_url:
                     self.total_videos += 1
                     content_id = item.get("id")
-                    signed_url = self.get_signed_url(video_url, content_id)
+                    signed_url = self.get_signed_url(video_url, content_id, course_id, 0)
                     links.append(f"Live - {name}: {signed_url}")
         except Exception as e:
             print(f"Error fetching live videos: {e}")
