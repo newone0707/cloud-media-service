@@ -87,13 +87,13 @@ async def download_m3u8(url, output_path, base_url):
                         'user-agent': 'Mobile-Android',
                     }
                     signed_api = f"https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={base_url_for_signing}"
-                    resp = requests.get(signed_api, headers=cp_headers)
+                    resp = cffi_requests.get(signed_api, headers=cp_headers, impersonate="chrome110")
                     if resp.status_code == 200:
                         res_json = resp.json()
                         if "url" in res_json:
                             url = res_json["url"] # Update the url to the newly signed one
 
-                r = requests.get(url, headers=headers)
+                r = cffi_requests.get(url, headers=headers, impersonate="chrome110")
                 r.raise_for_status()
                 master_text = r.text
                 
