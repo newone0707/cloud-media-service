@@ -10,6 +10,7 @@ from utils import progress_bar, decrypt_file
 
 # Global state to track uploads and stop requests
 upload_states = {}
+user_tokens = {}
 
 import asyncio
 
@@ -28,7 +29,7 @@ def sync_download(url, output_path, referer):
         print(f"Direct Download Error: {e}")
         return False
 
-async def download_m3u8(url, output_path, base_url):
+async def download_m3u8(url, output_path, base_url, user_id=None):
     print(f"Downloading URL: {url}")
     referer = base_url if base_url.endswith('/') else base_url + '/'
     
@@ -38,7 +39,49 @@ async def download_m3u8(url, output_path, base_url):
         'Origin': referer,
         'device-id': '39F093FF35F201D9'
     }
-    if "token=" in url:
+    
+    if user_id and user_id in user_tokens:
+        cp_token = user_tokens[user_id]
+        if 'classplusapp' in url or "testbook.com" in url or "classplusapp.com/drm" in url or "media-cdn.classplusapp.com/drm" in url:
+            try:
+                if '&' in url:
+                    url_part, contentId = url.split('&', 1)
+                else:
+                    url_part = url
+                
+                headers_api = {
+                    'host': 'api.classplusapp.com',
+                    'x-access-token': f'{cp_token}',    
+                    'accept-language': 'EN',
+                    'api-version': '18',
+                    'app-version': '1.4.73.2',
+                    'build-number': '35',
+                    'connection': 'Keep-Alive',
+                    'content-type': 'application/json',
+                    'device-details': 'Xiaomi_Redmi 7_SDK-32',
+                    'device-id': 'c28d3cb16bbdac01',
+                    'region': 'IN',
+                    'user-agent': 'Mobile-Android',
+                    'webengage-luid': '00000187-6fe4-5d41-a530-26186858be4c',
+                    'accept-encoding': 'gzip'
+                }
+                res = requests.get(f'https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={url_part}', headers=headers_api)
+                with open('debug.log', 'a') as f: f.write(f"JW API Status: {res.status_code}\nResult: {res.text}\n")
+                
+                if res.status_code == 200:
+                    try:
+                        new_url = res.json().get('data', {}).get('url')
+                        if new_url:
+                            url = new_url
+                    except:
+                        pass
+                
+                # In case jw-signed-url is just a distraction, let's also pass the token to yt-dlp headers:
+                headers['x-access-token'] = cp_token
+            except Exception as e:
+                with open('debug.log', 'a') as f: f.write(f"JW Logic Error: {e}\n")
+
+if "token=" in url:
         token = url.split("token=")[1].split("&")[0]
         headers['x-access-token'] = token
         headers['api-version'] = "18"
@@ -193,6 +236,16 @@ async def download_m3u8(url, output_path, base_url):
         import traceback
         print(f"YT-DLP Error:\n{traceback.format_exc()}")
         return False
+
+
+@Client.on_message(filters.command("token") & filters.private)
+async def token_cmd(client: Client, message: Message):
+    parts = message.text.split(" ", 1)
+    if len(parts) > 1:
+        user_tokens[message.from_user.id] = parts[1].strip()
+        await message.reply_text("Updated Token Used ✅")
+    else:
+        await message.reply_text("Please provide a token. Usage: /token <token>")
 
 @Client.on_message(filters.command("stop") & filters.private)
 async def stop_cmd(client: Client, message: Message):
