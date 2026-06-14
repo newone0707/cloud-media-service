@@ -68,14 +68,13 @@ async def download_m3u8(url, output_path, base_url):
     if "classplus" in url and "token=" in url:
         def sync_classplus_dl():
             try:
-                import urllib.parse
                 import re
                 import requests
                 
                 nonlocal url
-                # Re-sign the URL to bypass IP-pinned 403 Forbidden
-                base_url_for_signing = url.split("?")[0]
                 token_match = re.search(r"token=([^&]+)", url)
+                content_id_match = re.search(r"contentId=([^&]+)", url)
+                
                 if token_match:
                     token_val = token_match.group(1)
                     cp_headers = {
@@ -84,19 +83,37 @@ async def download_m3u8(url, output_path, base_url):
                         'accept-language': 'EN',
                         'api-version': '18',
                         'app-version': '1.4.73.2',
+                        'build-number': '35',
+                        'connection': 'Keep-Alive',
+                        'content-type': 'application/json',
+                        'device-details': 'Xiaomi_Redmi 7_SDK-32',
+                        'device-id': 'c28d3cb16bbdac01',
+                        'region': 'IN',
                         'user-agent': 'Mobile-Android',
+                        'webengage-luid': '00000187-6fe4-5d41-a530-26186858be4c',
+                        'accept-encoding': 'gzip'
                     }
-                    signed_api = f"https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={base_url_for_signing}"
-                    resp = cffi_requests.get(signed_api, headers=cp_headers, impersonate="chrome110")
+                    
+                    params = {}
+                    if content_id_match:
+                        params['contentId'] = content_id_match.group(1)
+                        params['offlineDownload'] = "false"
+                    else:
+                        params['url'] = url.split("?")[0]
+                        
+                    signed_api = "https://api.classplusapp.com/cams/uploader/video/jw-signed-url"
+                    resp = requests.get(signed_api, headers=cp_headers, params=params)
                     if resp.status_code == 200:
                         res_json = resp.json()
                         if "url" in res_json:
                             url = res_json["url"] # Update the url to the newly signed one
-
-                r = cffi_requests.get(url, headers=headers, impersonate="chrome110")
+                            
+                r = requests.get(url, headers=headers)
                 r.raise_for_status()
                 master_text = r.text
-                
+                print("master_text length:", len(master_text))
+
+                import urllib.parse
                 base_url_hls = url.split("?")[0].rsplit("/", 1)[0] + "/"
                 query_params = "?" + url.split("?")[1] if "?" in url else ""
                 
