@@ -27,7 +27,7 @@ if __name__ == "__main__":
     print("Starting Pyrogram Bot...")
     bot = Client(
         "leach_bot",
-        in_memory=True,
+        
         api_id=API_ID,
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
