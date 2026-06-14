@@ -70,13 +70,11 @@ class ClassplusClient:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def get_signed_url(self, file_url, content_hash):
+    def get_signed_url(self, file_url, content_id):
         if not file_url:
             return ""
-        if content_hash and any(x in file_url for x in ["classplusapp.com", "tencdn.classplusapp", "videos.classplusapp", "media-cdn"]):
-            import urllib.parse
-            encoded_hash = urllib.parse.quote(content_hash, safe="")
-            return f"{file_url}?contentHashId={encoded_hash}&token={self.token}"
+        if content_id and any(x in file_url for x in ["classplusapp.com", "tencdn.classplusapp", "videos.classplusapp", "media-cdn"]):
+            return f"{file_url}?contentId={content_id}&token={self.token}"
         return file_url
 
     def extract_links(self, course_id):
@@ -102,8 +100,8 @@ class ClassplusClient:
                         if file_url:
                             if c_type == 2:
                                 self.total_videos += 1
-                                content_hash = item.get("contentHashId")
-                                file_url = self.get_signed_url(file_url, content_hash)
+                                content_id = item.get("id")
+                                file_url = self.get_signed_url(file_url, content_id)
                             elif c_type == 3:
                                 self.total_pdfs += 1
                             links.append(f"{path}{name}: {file_url}")
@@ -122,8 +120,8 @@ class ClassplusClient:
                 video_url = item.get("url")
                 if video_url:
                     self.total_videos += 1
-                    content_hash = item.get("contentHashId")
-                    signed_url = self.get_signed_url(video_url, content_hash)
+                    content_id = item.get("id")
+                    signed_url = self.get_signed_url(video_url, content_id)
                     links.append(f"Live - {name}: {signed_url}")
         except Exception as e:
             print(f"Error fetching live videos: {e}")
