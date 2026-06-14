@@ -70,43 +70,44 @@ async def download_m3u8(url, output_path, base_url):
             try:
                 import re
                 import requests
+                import urllib.parse
                 
                 nonlocal url
                 token_match = re.search(r"token=([^&]+)", url)
                 content_id_match = re.search(r"contentId=([^&]+)", url)
+                course_id_match = re.search(r"courseId=([^&]+)", url)
+                folder_id_match = re.search(r"folderId=([^&]+)", url)
                 
-                if token_match:
+                if token_match and content_id_match and course_id_match and folder_id_match:
                     token_val = token_match.group(1)
+                    content_id = content_id_match.group(1)
+                    course_id = course_id_match.group(1)
+                    folder_id = folder_id_match.group(1)
+                    
                     cp_headers = {
                         'host': 'api.classplusapp.com',
                         'x-access-token': token_val,
                         'accept-language': 'EN',
-                        'api-version': '18',
-                        'app-version': '1.4.73.2',
-                        'build-number': '35',
-                        'connection': 'Keep-Alive',
-                        'content-type': 'application/json',
-                        'device-details': 'Xiaomi_Redmi 7_SDK-32',
-                        'device-id': 'c28d3cb16bbdac01',
-                        'region': 'IN',
-                        'user-agent': 'Mobile-Android',
-                        'webengage-luid': '00000187-6fe4-5d41-a530-26186858be4c',
-                        'accept-encoding': 'gzip'
+                        'api-version': '29',
+                        'app-version': '1.4.65.3',
+                        'device-id': '39F093FF35F201D9',
+                        'user-agent': 'Mobile-Android'
                     }
                     
-                    params = {}
-                    if content_id_match:
-                        params['contentId'] = content_id_match.group(1)
-                        params['offlineDownload'] = "false"
-                    else:
-                        params['url'] = url.split("?")[0]
-                        
-                    signed_api = "https://api.classplusapp.com/cams/uploader/video/jw-signed-url"
-                    resp = requests.get(signed_api, headers=cp_headers, params=params)
+                    # Fetch the folder contents directly from Classplus API again
+                    api_url = f"https://api.classplusapp.com/v2/course/content/get?courseId={course_id}&folderId={folder_id}"
+                    resp = requests.get(api_url, headers=cp_headers)
                     if resp.status_code == 200:
                         res_json = resp.json()
-                        if "url" in res_json:
-                            url = res_json["url"] # Update the url to the newly signed one
+                        items = res_json.get("data", {}).get("courseContent", [])
+                        for item in items:
+                            if str(item.get("id")) == str(content_id):
+                                fresh_url = item.get("url")
+                                fresh_hash = item.get("contentHashId")
+                                if fresh_url and fresh_hash:
+                                    encoded_hash = urllib.parse.quote(fresh_hash, safe="")
+                                    url = f"{fresh_url}?contentHashId={encoded_hash}&token={token_val}"
+                                break
                             
                 r = requests.get(url, headers=headers)
                 r.raise_for_status()
