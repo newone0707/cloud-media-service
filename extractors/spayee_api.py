@@ -159,22 +159,36 @@ class SpayeeClient:
                     await asyncio.sleep(5)
                 
                 js_eval = '''() => {
-                    const links = Array.from(document.querySelectorAll('a'));
-                    const courseLinks = links.filter(a => 
+                    let root = document.querySelector('main') || document.querySelector('.dashboard-container') || document.querySelector('.my-courses') || document;
+                    const links = Array.from(root.querySelectorAll('a'));
+                    
+                    const validLinks = links.filter(a => {
+                        let parent = a.parentElement;
+                        while(parent && parent !== document.body) {
+                            if (parent.tagName === 'NAV' || parent.tagName === 'HEADER' || parent.tagName === 'FOOTER' || parent.id.toLowerCase().includes('header') || parent.className.toLowerCase().includes('header')) return false;
+                            parent = parent.parentElement;
+                        }
+                        return true;
+                    });
+
+                    const courseLinks = validLinks.filter(a => 
                         a.href.includes('/s/store/courses/') || 
                         a.href.includes('/courses/') ||
                         a.href.includes('/course/') ||
                         a.href.includes('/products/') ||
                         a.href.includes('/t/c/')
                     );
+                    
                     const unique = [];
                     const seen = new Set();
                     courseLinks.forEach(a => {
+                        // ignore pure fragment or javascript links
+                        if (a.href.includes('javascript:') || a.getAttribute('href') === '#') return;
                         if (!seen.has(a.href)) {
                             seen.add(a.href);
                             let title = a.innerText.trim();
                             if (!title) { const img = a.querySelector('img'); if (img && img.alt) title = img.alt; }
-                            if (!title) title = "Unknown Course";
+                            if (!title) title = "Course";
                             if (title.length > 3) unique.push({id: a.href, title: title});
                         }
                     });
