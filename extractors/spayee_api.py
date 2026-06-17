@@ -345,12 +345,16 @@ class SpayeeClient:
                 page.on("response", handle_response)
                 
                 # Navigate to course page
-                await page.goto(course_id, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(15)
-                
-                # Try to trigger dynamic loads by scrolling
-                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                await asyncio.sleep(5)
+                try:
+                    await page.goto(course_id, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(15)
+                    
+                    # Try to trigger dynamic loads by scrolling
+                    await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    print(f"Goto timeout/error caught: {e}")
+                    pass
                 
                 # Also scrape HTML content for URLs and JSON strings
                 page_content = await page.content()
