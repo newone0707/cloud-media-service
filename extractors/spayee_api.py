@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import requests
 from urllib.parse import urlparse, unquote
@@ -261,7 +262,6 @@ class SpayeeClient:
                     return any(ext in u.lower() for ext in ['.jpg', '.png', '.jpeg', '.css', '.woff', '.ttf', '.js', '.ts', '.svg', '.ico'])
                 
                 def _extract_titles(data, current_chapter=""):
-                    import json
                     if isinstance(data, dict):
                         title = data.get('title') or data.get('chapterTitle') or data.get('name') or data.get('spayee:title') or ""
                         if 'spayee:resource' in data:
@@ -329,7 +329,6 @@ class SpayeeClient:
                             
                             # Parse JSON to map titles
                             try:
-                                import json
                                 data = json.loads(text)
                                 _extract_titles(data)
                             except:
@@ -360,7 +359,6 @@ class SpayeeClient:
                 page_content = await page.content()
                 
                 # Try to find JSON embedded in scripts
-                import json
                 scripts = re.findall(r'<script[^>]*>(.*?)</script>', page_content, re.DOTALL)
                 for script in scripts:
                     try:
@@ -405,7 +403,6 @@ class SpayeeClient:
                         suffix = f"*{mapped_id}"
                     else:
                         # try to find uuid in link
-                        import re
                         m = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', link)
                         if m:
                             suffix = f"*{m.group(1)}"
