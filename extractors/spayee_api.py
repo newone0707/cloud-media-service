@@ -46,15 +46,9 @@ class SpayeeClient:
         
     async def fetch_courses(self):
         try:
-            # Method 1: Try to get courses from public store page (works without full auth)
-            courses = self._fetch_courses_from_store()
-            if courses:
-                self.courses = courses
-                return {"success": True, "courses": courses}
-            
-            # Method 2: Try Playwright-based scraping
+            # ONLY use Playwright-based scraping to get the ACTUAL enrolled courses
+            # Store scraping gets junk public courses that the user isn't enrolled in.
             return await self._fetch_courses_playwright()
-            
         except Exception as e:
             return {"success": False, "error": str(e)}
     
@@ -293,14 +287,12 @@ class SpayeeClient:
                         full_title = f"({new_chapter}) {title}" if new_chapter else title
                         if not full_title.strip():
                             full_title = "Item"
-                            
                         if url and not _is_junk(url):
                             if url not in self.raw_links:
                                 self.raw_links.append(url)
                             self.title_map[url] = full_title
                             if item_id:
                                 self.id_map[url] = item_id
-                                
                         if item_id and title:
                             self.title_map[item_id] = full_title
                             
@@ -350,7 +342,19 @@ class SpayeeClient:
                     print(f"Goto timeout/error caught: {e}")
                     pass
                     
-                await asyncio.sleep(15)
+                await asyncio.sleep(5) # Initial load wait
+                
+                # If we are on a store page, we must click "Continue Learning" to reach the player where the curriculum is
+                try:
+                    continue_btn = await page.query_selector('.btn-continue, a[href*="/player/"], a[href*="/t/c/"], button:has-text("Continue")')
+                    if continue_btn:
+                        print("Found Continue Learning button! Clicking it to reach player...")
+                        await continue_btn.click()
+                        await asyncio.sleep(10) # Wait for player to load
+                except Exception as e:
+                    print(f"Error clicking continue: {e}")
+                    
+                await asyncio.sleep(10) # Wait for curriculum JSONs to finish loading
                 
                 try:
                     # Try to trigger dynamic loads by scrolling
