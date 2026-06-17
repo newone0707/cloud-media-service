@@ -31,6 +31,7 @@ async def handle_callbacks(client: Client, query: CallbackQuery):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📱 AppX", callback_data="platform_appx")],
             [InlineKeyboardButton("📚 Classplus", callback_data="platform_classplus")],
+            [InlineKeyboardButton("🎥 Graphy / Spayee", callback_data="platform_spayee")],
             [InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]
         ])
         await query.message.edit_caption(
@@ -82,6 +83,23 @@ async def handle_callbacks(client: Client, query: CallbackQuery):
                 "`eyJhbGciOiJIUzI1NiIsInR5...`\n\n"
                 "> _Example:_\n"
                 "> `aiex*9999999999`"
+            ),
+            reply_markup=keyboard
+        )
+
+    elif data == "platform_spayee":
+        set_state(user_id, "WAITING_FOR_SPAYEE_CREDS")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="menu_platforms")]
+        ])
+        await query.message.edit_caption(
+            caption=(
+                "**🎥 Graphy / Spayee Extraction Engine**\n\n"
+                "Please send your Base URL and your Credentials in the chat.\n\n"
+                "**Format:**\n"
+                "`[URL] [EMAIL]*[PASSWORD]`\n\n"
+                "> _Example:_\n"
+                "> `https://www.ganitank.com user@mail.com*pass123`"
             ),
             reply_markup=keyboard
         )
