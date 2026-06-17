@@ -1,8 +1,6 @@
 import os
-import re
 import time
 import asyncio
-import concurrent.futures
 import yt_dlp
 import requests
 from curl_cffi import requests as cffi_requests
@@ -10,241 +8,176 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from utils import progress_bar, decrypt_file
 
-# Global state
+# Global state to track uploads and stop requests
 upload_states = {}
-user_tokens = {}
 
-# -------------------------------------------------------------
-# HELPERS
-# -------------------------------------------------------------
+import asyncio
 
-def build_referer(base_url: str) -> str:
-    """
-    Given the raw BaseURL from the txt file (API URL),
-    strip the 'api' suffix from the subdomain and return
-    the frontend URL with a trailing slash.
-    Works for classx.co.in, appx.co.in, akamai.net.in etc.
-    """
-    base_url = base_url.strip().rstrip('/')
-    # Match: protocol://tenantapi.domain OR protocol://tenant.domain
-    m = re.match(r'(https?://)([^.]+?)(api)?\.(.+)$', base_url, re.IGNORECASE)
-    if m:
-        proto   = m.group(1)
-        tenant  = m.group(2)
-        domain  = m.group(4)
-        return f"{proto}{tenant}.{domain}/"
-    return base_url + '/'
-
-def is_video_link(url: str) -> bool:
-    path = url.split('?')[0].lower()
-    return any(path.endswith(ext) for ext in ['.mp4', '.mkv', '.m3u8', '.webm', '.ts'])
-
-def is_pdf_link(url: str) -> bool:
-    path = url.split('?')[0].lower()
-    return path.endswith('.pdf')
-
-def strip_aes_key(link: str):
-    """
-    AppX links look like:  url*key:iv  or  url:key
-    Returns (clean_url, aes_key_or_None)
-    """
-    # Pattern: ...Signature=xxxxx*KeyData:IVData
-    if '*' in link:
-        parts = link.split('*', 1)
-        clean = parts[0]
-        key = parts[1]
-        return clean, key
-    # Pattern: ...Signature=xxxxx:ZmVkY...
-    if re.search(r'[A-Za-z0-9+/=]{20,}:[A-Za-z0-9+/=]{20,}$', link):
-        idx = link.rfind(':')
-        maybe_key = link[idx+1:]
-        if len(maybe_key) >= 20 and re.match(r'^[A-Za-z0-9+/=]+$', maybe_key):
-            return link[:idx], maybe_key
-    return link, None
-
-
-def sync_download_direct(url, output_path, referer):
-    """Direct download with curl_cffi Chrome impersonation - works for AppX/ClassX CDN."""
+def sync_download(url, output_path, referer):
+    print(f"DEBUG sync_download URL: {url}")
     try:
-        h = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer':    referer,
-            'Origin':     referer.rstrip('/'),
-        }
-        r = cffi_requests.get(url, stream=True, headers=h, impersonate='chrome', timeout=120)
+        r = cffi_requests.get(url, stream=True, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': referer, 'Origin': referer})
         r.raise_for_status()
         with open(output_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=65536):
+            for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
         return True
     except Exception as e:
+        with open('debug.log', 'a') as debug_f:
+            debug_f.write(f"Direct Download Error: {e}\n")
         print(f"Direct Download Error: {e}")
         return False
 
-
-async def download_video(url, output_path, referer, user_id=None):
-    """
-    Universal video downloader:
-    - AppX encrypted MP4/MKV -> direct curl_cffi
-    - Classplus HLS -> custom HLS + yt-dlp pipeline
-    - YouTube / generic -> yt-dlp
-    """
-    referer = referer if referer.endswith('/') else referer + '/'
-
+async def download_m3u8(url, output_path, base_url):
+    print(f"Downloading URL: {url}")
+    referer = base_url if base_url.endswith('/') else base_url + '/'
+    
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Referer': referer,
-        'Origin': referer.rstrip('/'),
+        'Origin': referer,
         'device-id': '39F093FF35F201D9'
     }
-
-    # -- Classplus token-based HLS ------------------------------
-    if user_id and user_id in user_tokens and ('classplusapp' in url or 'testbook.com' in url):
-        cp_token = user_tokens[user_id]
-        headers_api = {
-            'host': 'api.classplusapp.com',
-            'x-access-token': cp_token,
-            'accept-language': 'EN',
-            'api-version': '18',
-            'app-version': '1.4.73.2',
-            'build-number': '35',
-            'connection': 'Keep-Alive',
-            'content-type': 'application/json',
-            'device-details': 'Xiaomi_Redmi 7_SDK-32',
-            'device-id': 'c28d3cb16bbdac01',
-            'region': 'IN',
-            'user-agent': 'Mobile-Android',
-            'accept-encoding': 'gzip'
-        }
-        try:
-            res = requests.get(
-                f'https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={url.split("&")[0]}',
-                headers=headers_api
-            )
-            if res.status_code == 200:
-                new_url = res.json().get('data', {}).get('url')
-                if new_url:
-                    url = new_url
-            headers['x-access-token'] = cp_token
-        except Exception as e:
-            print(f"JW Logic Error: {e}")
-
-    # -- Classplus direct HLS download --------------------------
-    if 'classplus' in url and 'token=' in url:
-        def sync_classplus_dl():
-            try:
-                token_match  = re.search(r"token=([^&]+)", url)
-                content_id_match = re.search(r"contentId=([^&]+)", url)
-                course_id_match  = re.search(r"courseId=([^&]+)", url)
-                folder_id_match  = re.search(r"folderId=([^&]+)", url)
-
-                nonlocal url  # noqa
-                if token_match and content_id_match and course_id_match and folder_id_match:
-                    cp_headers = {
-                        'host': 'api.classplusapp.com',
-                        'x-access-token': token_match.group(1),
-                        'api-version': '29',
-                        'app-version': '1.4.65.3',
-                        'device-id': '39F093FF35F201D9',
-                        'user-agent': 'Mobile-Android'
-                    }
-                    resp = requests.get(
-                        f"https://api.classplusapp.com/v2/course/content/get?"
-                        f"courseId={course_id_match.group(1)}&folderId={folder_id_match.group(1)}",
-                        headers=cp_headers
-                    )
-                    if resp.status_code == 200:
-                        import urllib.parse
-                        for item in resp.json().get("data", {}).get("courseContent", []):
-                            if str(item.get("id")) == content_id_match.group(1):
-                                fresh_url = item.get("url")
-                                fresh_hash = item.get("contentHashId")
-                                if fresh_url and fresh_hash:
-                                    url = (f"{fresh_url}?contentHashId="
-                                           f"{urllib.parse.quote(fresh_hash, safe='')}"
-                                           f"&token={token_match.group(1)}")
-                                break
-
-                r = requests.get(url, headers=headers)
-                r.raise_for_status()
-                import urllib.parse
-                master_text = r.text
-                base_hls = url.split('?')[0].rsplit('/', 1)[0] + '/'
-                query = '?' + url.split('?')[1] if '?' in url else ''
-
-                max_bw, best_url = 0, None
-                m3u8_lines = master_text.splitlines()
-                for j, ln in enumerate(m3u8_lines):
-                    if ln.startswith('#EXT-X-STREAM-INF'):
-                        bw_m = re.search(r'BANDWIDTH=(\d+)', ln)
-                        bw = int(bw_m.group(1)) if bw_m else 0
-                        if bw >= max_bw:
-                            max_bw = bw
-                            best_url = m3u8_lines[j+1].strip()
-
-                if best_url:
-                    if not best_url.startswith('http'):
-                        best_url = urllib.parse.urljoin(base_hls, best_url)
-                    r2 = cffi_requests.get(best_url + query, headers=headers, impersonate='chrome')
-                    r2.raise_for_status()
-                    sub_text = r2.text
-                    base_hls = best_url.split('?')[0].rsplit('/', 1)[0] + '/'
-                else:
-                    sub_text = master_text
-
-                new_lines = []
-                for ln in sub_text.splitlines():
-                    if ln.startswith('#EXT-X-KEY'):
-                        uri_m = re.search(r'URI="([^"]+)"', ln)
-                        if uri_m:
-                            uri = uri_m.group(1)
-                            abs_uri = urllib.parse.urljoin(base_hls, uri) if not uri.startswith('http') else uri
-                            ln = ln.replace(f'URI="{uri}"', f'URI="{abs_uri}{query}"')
-                        new_lines.append(ln)
-                    elif ln and not ln.startswith('#'):
-                        abs_ln = urllib.parse.urljoin(base_hls, ln) if not ln.startswith('http') else ln
-                        new_lines.append(abs_ln + query)
-                    else:
-                        new_lines.append(ln)
-
-                local_m3u8 = output_path + '.m3u8'
-                with open(local_m3u8, 'w') as f:
-                    f.write('\n'.join(new_lines))
-
-                with yt_dlp.YoutubeDL({'format': 'best', 'outtmpl': output_path, 'quiet': False, 'http_headers': headers}) as ydl:
-                    ret = ydl.download([local_m3u8])
-                if os.path.exists(local_m3u8):
-                    os.remove(local_m3u8)
-                return ret == 0
-            except Exception as e:
-                import traceback
-                print(f"Classplus DL Error:\n{traceback.format_exc()}")
-                return False
-        return await asyncio.to_thread(sync_classplus_dl)
-
-    # -- AppX / ClassX direct encrypted files ------------------
-    if is_video_link(url) and ('appx' in url or 'classx' in url or 'akamai' in url or 'encrypted' in url):
-        return await asyncio.to_thread(sync_download_direct, url, output_path, referer)
-
-    # -- JWT token-based streaming URL -------------------------
-    if 'token=' in url:
-        token = url.split('token=')[1].split('&')[0]
+    if "token=" in url:
+        token = url.split("token=")[1].split("&")[0]
         headers['x-access-token'] = token
-        headers['api-version'] = '18'
+        headers['api-version'] = "18"
         try:
-            import base64, json as _json
-            payload = token.split('.')[1]
-            padded = payload + '=' * ((4 - len(payload) % 4) % 4)
-            jwt_data = _json.loads(base64.b64decode(padded).decode('utf-8'))
-            if 'fingerprintId' in jwt_data:
-                headers['device-id'] = jwt_data['fingerprintId']
+            import base64
+            import json
+            payload = token.split(".")[1]
+            padded = payload + "=" * ((4 - len(payload) % 4) % 4)
+            jwt_data = json.loads(base64.b64decode(padded).decode("utf-8"))
+            if "fingerprintId" in jwt_data:
+                headers['device-id'] = jwt_data["fingerprintId"]
             else:
                 headers['User-Agent'] = 'Mobile-Android'
                 headers['app-version'] = '1.4.65.3'
         except:
             pass
+    elif "appx" in url or "encrypted" in url:
+        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        if "appx" in referer:
+            headers['Referer'] = referer
+            headers['Origin'] = referer
 
-    # -- Generic fallback: yt-dlp ------------------------------
+    if "encrypted.mkv" in url or "encrypted.mp4" in url or ".zip" in url or "appx" in url:
+        # Download directly via requests for direct files (in background thread)
+        return await asyncio.to_thread(sync_download, url, output_path, referer)
+    
+    if "classplus" in url and "token=" in url:
+        def sync_classplus_dl():
+            try:
+                import re
+                import requests
+                import urllib.parse
+                
+                nonlocal url
+                token_match = re.search(r"token=([^&]+)", url)
+                content_id_match = re.search(r"contentId=([^&]+)", url)
+                course_id_match = re.search(r"courseId=([^&]+)", url)
+                folder_id_match = re.search(r"folderId=([^&]+)", url)
+                
+                if token_match and content_id_match and course_id_match and folder_id_match:
+                    token_val = token_match.group(1)
+                    content_id = content_id_match.group(1)
+                    course_id = course_id_match.group(1)
+                    folder_id = folder_id_match.group(1)
+                    
+                    cp_headers = {
+                        'host': 'api.classplusapp.com',
+                        'x-access-token': token_val,
+                        'accept-language': 'EN',
+                        'api-version': '29',
+                        'app-version': '1.4.65.3',
+                        'device-id': '39F093FF35F201D9',
+                        'user-agent': 'Mobile-Android'
+                    }
+                    
+                    # Fetch the folder contents directly from Classplus API again
+                    api_url = f"https://api.classplusapp.com/v2/course/content/get?courseId={course_id}&folderId={folder_id}"
+                    resp = requests.get(api_url, headers=cp_headers)
+                    if resp.status_code == 200:
+                        res_json = resp.json()
+                        items = res_json.get("data", {}).get("courseContent", [])
+                        for item in items:
+                            if str(item.get("id")) == str(content_id):
+                                fresh_url = item.get("url")
+                                fresh_hash = item.get("contentHashId")
+                                if fresh_url and fresh_hash:
+                                    encoded_hash = urllib.parse.quote(fresh_hash, safe="")
+                                    url = f"{fresh_url}?contentHashId={encoded_hash}&token={token_val}"
+                                break
+                            
+                r = requests.get(url, headers=headers)
+                r.raise_for_status()
+                master_text = r.text
+                print("master_text length:", len(master_text))
+
+                import urllib.parse
+                base_url_hls = url.split("?")[0].rsplit("/", 1)[0] + "/"
+                query_params = "?" + url.split("?")[1] if "?" in url else ""
+                
+                max_bw = 0
+                best_res_url = None
+                lines = master_text.splitlines()
+                for j, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF"):
+                        bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+                        bw = int(bw_match.group(1)) if bw_match else 0
+                        if bw >= max_bw:
+                            max_bw = bw
+                            best_res_url = lines[j+1].strip()
+                
+                if best_res_url:
+                    if not best_res_url.startswith("http"):
+                        best_res_url = urllib.parse.urljoin(base_url_hls, best_res_url)
+                    r2 = cffi_requests.get(best_res_url + query_params, headers=headers, impersonate='chrome')
+                    r2.raise_for_status()
+                    sub_text = r2.text
+                    base_url_hls = best_res_url.split("?")[0].rsplit("/", 1)[0] + "/"
+                else:
+                    sub_text = master_text
+                    
+                new_lines = []
+                for line in sub_text.splitlines():
+                    if line.startswith("#EXT-X-KEY"):
+                        uri_match = re.search(r'URI="([^"]+)"', line)
+                        if uri_match:
+                            uri = uri_match.group(1)
+                            abs_uri = urllib.parse.urljoin(base_url_hls, uri) if not uri.startswith("http") else uri
+                            line = line.replace(f'URI="{uri}"', f'URI="{abs_uri}{query_params}"')
+                        new_lines.append(line)
+                    elif line and not line.startswith("#"):
+                        abs_line = urllib.parse.urljoin(base_url_hls, line) if not line.startswith("http") else line
+                        new_lines.append(abs_line + query_params)
+                    else:
+                        new_lines.append(line)
+                        
+                local_m3u8 = output_path + ".m3u8"
+                with open(local_m3u8, "w") as f:
+                    f.write("\n".join(new_lines))
+                    
+                ydl_opts_local = {
+                    'format': 'best',
+                    'outtmpl': output_path,
+                    'quiet': False,
+                    'no_warnings': False,
+                    'http_headers': headers
+                }
+                with yt_dlp.YoutubeDL(ydl_opts_local) as ydl:
+                    ret = ydl.download([local_m3u8])
+                    
+                if os.path.exists(local_m3u8):
+                    os.remove(local_m3u8)
+                    
+                return ret == 0
+            except Exception as e:
+                import traceback
+                print(f"Classplus Custom DL Error:\n{traceback.format_exc()}")
+                return False
+        return await asyncio.to_thread(sync_classplus_dl)
+
     ydl_opts = {
         'format': 'best',
         'outtmpl': output_path,
@@ -254,65 +187,26 @@ async def download_video(url, output_path, referer, user_id=None):
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.download([url]) == 0
+            ret = ydl.download([url])
+            return ret == 0
     except Exception as e:
         import traceback
         print(f"YT-DLP Error:\n{traceback.format_exc()}")
         return False
 
-
-def sync_download_pdf(url, output_path, referer):
-    """Synchronous PDF download. Handles Classplus token URLs and AppX CDN."""
-    try:
-        h = {'User-Agent': 'Mozilla/5.0', 'device-id': '39F093FF35F201D9'}
-
-        if 'token=' in url:
-            token = url.split('token=')[1].split('&')[0]
-            h['x-access-token'] = token
-            h['api-version'] = '18'
-        elif 'appx' in url or 'classx' in url or 'akamai' in url:
-            ref = referer if referer.endswith('/') else referer + '/'
-            h['Referer'] = ref
-            h['Origin'] = ref.rstrip('/')
-
-        r = cffi_requests.get(url, stream=True, headers=h, impersonate='chrome', timeout=60)
-        r.raise_for_status()
-        with open(output_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                f.write(chunk)
-        return True
-    except Exception as e:
-        print(f"PDF Download Error: {e}")
-        return False
-
-
-# -------------------------------------------------------------
-# BOT COMMANDS
-# -------------------------------------------------------------
-
-@Client.on_message(filters.command("token") & filters.private)
-async def token_cmd(client: Client, message: Message):
-    parts = message.text.split(" ", 1)
-    if len(parts) > 1:
-        user_tokens[message.from_user.id] = parts[1].strip()
-        await message.reply_text("? Token updated!")
-    else:
-        await message.reply_text("Usage: /token <your_token>")
-
-
 @Client.on_message(filters.command("stop") & filters.private)
 async def stop_cmd(client: Client, message: Message):
-    uid = message.from_user.id
-    if uid in upload_states and upload_states[uid].get("is_uploading"):
-        upload_states[uid]["stop_requested"] = True
-        await message.reply_text("?? **Stop requested! Halting after current file.**")
+    user_id = message.from_user.id
+    if user_id in upload_states and upload_states[user_id].get("is_uploading"):
+        upload_states[user_id]["stop_requested"] = True
+        await message.reply_text("🛑 **Stop requested! The process will halt after the current file finishes.**")
     else:
-        await message.reply_text("? No upload currently running.")
-
+        await message.reply_text("❌ **No upload process is currently running.**")
 
 @Client.on_message(filters.command("upload") & filters.private)
 async def upload_cmd(client: Client, message: Message):
-    uid = message.from_user.id
+    user_id = message.from_user.id
+    
     parts = message.text.split(" ")
     limit = 0
     if len(parts) > 1:
@@ -321,219 +215,231 @@ async def upload_cmd(client: Client, message: Message):
         elif parts[1].lower() == "all":
             limit = -1
         else:
-            await message.reply_text("Usage: /upload [count] or /upload all")
+            await message.reply_text("❌ **Usage:** `/upload [count]` or `/upload all`")
             return
     else:
-        await message.reply_text("Usage: /upload [count] or /upload all")
+        await message.reply_text("❌ **Usage:** `/upload [count]` or `/upload all`")
         return
-
-    upload_states[uid] = {
+        
+    upload_states[user_id] = {
         "waiting_for_file": True,
         "limit": limit,
         "is_uploading": False,
         "stop_requested": False
     }
-    await message.reply_text(
-        f"? **Ready! Will upload {limit if limit > 0 else 'ALL'} links.**\n\n"
-        "?? Send me the .txt file now."
-    )
-
+    
+    await message.reply_text(f"✅ **Ready to upload {limit if limit > 0 else 'ALL'} links!**\n\n📄 **Please send me the `.txt` file containing the extracted links now.**")
 
 @Client.on_message(filters.document & filters.private)
 async def handle_document(client: Client, message: Message):
-    uid = message.from_user.id
-    if uid not in upload_states or not upload_states[uid].get("waiting_for_file"):
+    user_id = message.from_user.id
+    if user_id not in upload_states or not upload_states[user_id].get("waiting_for_file"):
         return
-
+        
     doc = message.document
     if not doc.file_name.endswith('.txt'):
-        await message.reply_text("? Please send a .txt file.")
+        await message.reply_text("❌ **Please send a valid `.txt` file.**")
         return
-
-    state = upload_states[uid]
+        
+    state = upload_states[user_id]
     state["waiting_for_file"] = False
     state["is_uploading"] = True
     state["stop_requested"] = False
     limit = state["limit"]
-
-    status_msg = await message.reply_text("? **Parsing your file...**")
+    
+    status_msg = await message.reply_text("⏳ **Downloading and parsing your file...**")
     file_data = await message.download(in_memory=True)
-
+    
     try:
         content = file_data.getvalue().decode("utf-8")
-        lines = content.splitlines()
+        lines = content.splitlines(True)
     except Exception as e:
-        await status_msg.edit_text(f"? Failed to read file: {e}")
+        await status_msg.edit_text(f"❌ **Failed to read file:** {e}")
         state["is_uploading"] = False
         return
+    finally:
+        pass
 
-    # -- Parse the txt -----------------------------------------
     links_to_upload = []
-    global_referer = "https://web.classplusapp.com/"
-
-    for raw_line in lines:
-        line = raw_line.strip()
+    base_url = "https://web.classplusapp.com/"
+    for line in lines:
+        line = line.strip()
         if not line or line.startswith("Course:"):
             continue
         if line.startswith("BaseURL:"):
-            raw_base = line.split("BaseURL:", 1)[1].strip()
-            global_referer = build_referer(raw_base)
+            base_url = line.split("BaseURL:")[1].strip()
             continue
-        # Skip encrypted Video: blobs (not downloadable directly)
-        if re.match(r'^(Home\s*>.*?>\s*)?Video:\s*[A-Za-z0-9+/]{20}', line):
-            continue
-        # Named links: "path > title: https://..."
         if ": " in line:
             name, link = line.split(": ", 1)
             if link.startswith("http"):
                 links_to_upload.append({"name": name.strip(), "link": link.strip()})
         elif line.startswith("http"):
-            links_to_upload.append({"name": "Video", "link": line.strip()})
+             links_to_upload.append({"name": "Video", "link": line.strip()})
 
     if limit > 0:
         links_to_upload = links_to_upload[:limit]
 
     if not links_to_upload:
-        await status_msg.edit_text("? No valid links found in the file.")
+        await status_msg.edit_text("❌ **No valid links found in the file.**")
         state["is_uploading"] = False
         return
 
-    await status_msg.edit_text(
-        f"?? **Found {len(links_to_upload)} items. Starting...**\n\n_(Send /stop to halt)_"
-    )
+    await status_msg.edit_text(f"🚀 **Found {len(links_to_upload)} links. Starting upload process...**\n\n*(Send /stop anytime to halt)*")
 
     uploaded_count = 0
-
     for i, item in enumerate(links_to_upload):
         if state["stop_requested"]:
-            await message.reply_text("?? **Stopped!**")
+            await message.reply_text("🛑 **Process stopped by user!**")
             break
-
+            
         name = item["name"]
-        raw_link = item["link"]
+        link = item["link"]
+        prog_msg = await message.reply_text(f"⏳ **Processing {i+1}/{len(links_to_upload)}:**\n`{name}`")
+        
+        if ".pdf" in link.lower() or "pdf" in name.lower():
+            # Download PDF
+            await prog_msg.edit_text(f"⏳ **Downloading PDF:**\n`{name}`")
+            pdf_path = f"{name}.pdf"
+            import re
+            pdf_path = re.sub(r'[\\/*?:"<>|]', '_', pdf_path) # sanitize
+            
+            aes_key = None
+            if ":Zm" in link or ":" in link.split("/")[-1]:
+                parts = link.rsplit(":", 1)
+                if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
+                    link, aes_key = parts
+            elif "*" in link:
+                parts = link.rsplit("*", 1)
+                if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
+                    link, aes_key = parts
 
-        prog_msg = await message.reply_text(
-            f"? **[{i+1}/{len(links_to_upload)}]**\n{name}"
-        )
-
-        # Strip AES key if present
-        link, aes_key = strip_aes_key(raw_link)
-
-        # Detect file type
-        file_is_pdf   = is_pdf_link(link)
-        file_is_video = is_video_link(link)
-        # If neither detected by extension, guess from name
-        if not file_is_pdf and not file_is_video:
-            if 'pdf' in name.lower():
-                file_is_pdf = True
-            else:
-                file_is_video = True
-
-        # -- PDF ------------------------------------------------
-        if file_is_pdf:
-            await prog_msg.edit_text(f"? **Downloading PDF:**\n{name}")
-            safe_name = re.sub(r'[\\/*?:"<>|]', '_', name)
-            pdf_path = f"{safe_name}.pdf"
-
-            success = await asyncio.to_thread(sync_download_pdf, link, pdf_path, global_referer)
-
+            def sync_pdf_dl(actual_link):
+                try:
+                    h = {'User-Agent': 'Mozilla/5.0', 'device-id': '39F093FF35F201D9'}
+                    if "token=" in actual_link:
+                        token = link.split("token=")[1].split("&")[0]
+                        h['x-access-token'] = token
+                        h['api-version'] = "18"
+                        try:
+                            import base64
+                            import json
+                            payload = token.split(".")[1]
+                            padded = payload + "=" * ((4 - len(payload) % 4) % 4)
+                            jwt_data = json.loads(base64.b64decode(padded).decode("utf-8"))
+                            if "fingerprintId" in jwt_data:
+                                h['device-id'] = jwt_data["fingerprintId"]
+                            else:
+                                h['User-Agent'] = 'Mobile-Android'
+                                h['app-version'] = '1.4.65.3'
+                        except:
+                            pass
+                    r = cffi_requests.get(actual_link, stream=True, headers=h)
+                    r.raise_for_status()
+                    with open(pdf_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    return True
+                except Exception as e:
+                    with open('debug.log', 'a') as debug_f:
+                        debug_f.write(f"PDF Download Error: {e}\n")
+                    print(f"PDF Download Error: {e}")
+                    return False
+            success = await asyncio.to_thread(sync_pdf_dl, link)
+            
             if success and aes_key and os.path.exists(pdf_path):
-                await prog_msg.edit_text(f"?? **Decrypting PDF...**\n{name}")
-                if not decrypt_file(pdf_path, aes_key):
+                decrypted = decrypt_file(pdf_path, aes_key)
+                if not decrypted:
                     success = False
 
             if state["stop_requested"]:
                 break
-
-            if success and os.path.exists(pdf_path):
+                
+            if success:
                 start_time = time.time()
                 try:
                     await client.send_document(
                         chat_id=message.chat.id,
                         document=pdf_path,
-                        caption=f"?? **{name}**",
+                        caption=f"📄 **{name}**",
                         progress=progress_bar,
                         progress_args=(prog_msg, start_time)
                     )
                     await prog_msg.delete()
                     uploaded_count += 1
                 except Exception as e:
-                    await prog_msg.edit_text(f"? Upload failed:\n{e}")
+                    with open('debug.log', 'a') as debug_f:
+                        debug_f.write(f"Upload Error: {e}\n")
+                    await prog_msg.edit_text(f"❌ **Failed to upload PDF:**\n`{e}`")
             else:
-                await prog_msg.edit_text(f"? PDF download failed:\n{name}")
-
+                await prog_msg.edit_text(f"❌ **Failed to download PDF:**\n`{name}`")
+            
             if os.path.exists(pdf_path):
                 os.remove(pdf_path)
-
-        # -- VIDEO ----------------------------------------------
         else:
-            await prog_msg.edit_text(f"? **Downloading Video:**\n{name}")
-            safe_name = re.sub(r'[\\/*?:"<>|]', '_', name)
-            # Preserve mkv extension if needed
-            ext = '.mkv' if link.split('?')[0].lower().endswith('.mkv') else '.mp4'
-            vid_path = f"{safe_name}{ext}"
-
-            success = await download_video(link, vid_path, global_referer, user_id=uid)
-
-            if success and aes_key and os.path.exists(vid_path):
-                await prog_msg.edit_text(f"?? **Decrypting...**\n{name}")
-                if not decrypt_file(vid_path, aes_key):
+            # Download Video
+            await prog_msg.edit_text(f"⏳ **Downloading Video (This may take a while):**\n`{name}`")
+            import re
+            mp4_path = f"{name}.mp4"
+            mp4_path = re.sub(r'[\\/*?:"<>|]', '_', mp4_path)
+            
+            aes_key = None
+            if ":Zm" in link or ":" in link.split("/")[-1]: # Appx AES keys often start with Zm or are appended with :
+                parts = link.rsplit(":", 1)
+                if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
+                    link, aes_key = parts
+            elif "*" in link:
+                parts = link.rsplit("*", 1)
+                if len(parts) == 2 and len(parts[1]) > 10 and "=" in parts[1]:
+                    link, aes_key = parts
+            
+            success = await download_m3u8(link, mp4_path, base_url)
+            
+            if success and aes_key and os.path.exists(mp4_path):
+                await prog_msg.edit_text(f"⏳ **Decrypting Video...**\n`{name}`")
+                decrypted = decrypt_file(mp4_path, aes_key)
+                if not decrypted:
                     success = False
-
+            
             if state["stop_requested"]:
-                if os.path.exists(vid_path):
-                    os.remove(vid_path)
+                if os.path.exists(mp4_path):
+                    os.remove(mp4_path)
                 break
-
-            if success and os.path.exists(vid_path):
+                
+            if success and os.path.exists(mp4_path):
                 start_time = time.time()
                 try:
-                    parts_name = [p.strip() for p in name.split(">")]
-                    video_title = parts_name[-1]
-                    topic_name  = parts_name[-2] if len(parts_name) > 1 else "Home"
-                    batch_name  = parts_name[1] if len(parts_name) > 2 else parts_name[0]
-                    vid_id      = f"{i+1:03d}"
-
-                    caption = (
-                        f"[??] **Vid Id** : {vid_id}\n"
-                        f"**Video Title** : {video_title}\n"
-                        f"**Topic Name** : {topic_name}\n"
-                        f"**Batch Name** : {batch_name}\n\n"
-                        f"**Extracted By** ? Clean Leach Bot"
-                    )
-
-                    # Metadata with ffprobe
-                    thumb_path = f"{vid_path}.jpg"
+                    parts = [p.strip() for p in name.split(">")]
+                    video_title = parts[-1]
+                    topic_name = parts[-2] if len(parts) > 1 else "Home"
+                    batch_name = parts[1] if len(parts) > 2 else (parts[0] if len(parts) > 0 else "Unknown")
+                    vid_id = f"{i+1:03d}"
+                    
+                    custom_caption = f"""[🎥] **Vid Id** : `{vid_id}`\n**Video Title** : `{video_title}`\n**Topic Name** : `{topic_name}`\n**Batch Name** : `{batch_name}`\n\n**Extracted By** ➢ Clean Leach Bot"""
+                    
+                    # Extract Metadata
+                    thumb_path = f"{mp4_path}.jpg"
                     duration, width, height = 0, 0, 0
                     try:
-                        import subprocess, json as _json2
-                        meta = _json2.loads(
-                            subprocess.check_output(
-                                ["ffprobe", "-v", "quiet", "-print_format", "json",
-                                 "-show_format", "-show_streams", vid_path],
-                                stderr=subprocess.STDOUT
-                            ).decode("utf-8")
-                        )
+                        import subprocess, json
+                        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", mp4_path]
+                        res = await asyncio.to_thread(subprocess.check_output, cmd, stderr=subprocess.STDOUT)
+                        meta = json.loads(res.decode("utf-8"))
                         duration = int(float(meta.get("format", {}).get("duration", 0)))
                         for stream in meta.get("streams", []):
                             if stream.get("codec_type") == "video":
-                                width  = int(stream.get("width", 0))
+                                width = int(stream.get("width", 0))
                                 height = int(stream.get("height", 0))
                                 break
-                        subprocess.check_output(
-                            ["ffmpeg", "-y", "-i", vid_path,
-                             "-ss", "00:00:02.000", "-vframes", "1", thumb_path],
-                            stderr=subprocess.STDOUT
-                        )
-                        if not os.path.exists(thumb_path):
-                            thumb_path = None
+                        thumb_cmd = ["ffmpeg", "-y", "-i", mp4_path, "-ss", "00:00:02.000", "-vframes", "1", thumb_path]
+                        await asyncio.to_thread(subprocess.check_output, thumb_cmd, stderr=subprocess.STDOUT)
+                        if not os.path.exists(thumb_path): thumb_path = None
                     except:
                         thumb_path = None
-
+                    
                     await client.send_video(
                         chat_id=message.chat.id,
-                        video=vid_path,
-                        caption=caption,
+                        video=mp4_path,
+                        caption=custom_caption,
                         supports_streaming=True,
                         duration=duration,
                         width=width,
@@ -547,14 +453,14 @@ async def handle_document(client: Client, message: Message):
                     await prog_msg.delete()
                     uploaded_count += 1
                 except Exception as e:
-                    await prog_msg.edit_text(f"? Upload failed:\n{e}")
+                    with open('debug.log', 'a') as debug_f:
+                        debug_f.write(f"Video Upload Error: {e}\n")
+                    await prog_msg.edit_text(f"❌ **Failed to upload:**\n`{e}`")
                 finally:
-                    if os.path.exists(vid_path):
-                        os.remove(vid_path)
+                    if os.path.exists(mp4_path):
+                        os.remove(mp4_path)
             else:
-                await prog_msg.edit_text(f"? Video download failed:\n{name}")
+                await prog_msg.edit_text(f"❌ **Failed to download Video:**\n`{name}`")
 
     state["is_uploading"] = False
-    await message.reply_text(
-        f"? **Done! Processed {uploaded_count}/{len(links_to_upload)} files.**"
-    )
+    await message.reply_text(f"✅ **Finished! Successfully processed {uploaded_count} files.**")
