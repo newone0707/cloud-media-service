@@ -193,6 +193,11 @@ class SpayeeClient:
 
     async def extract_links(self, course_id):
         """Extract video/PDF links from a course page"""
+        if not getattr(self, 'session_id', None) or not getattr(self, 'token', None):
+            login_res = self._login_api()
+            if not login_res.get("success"):
+                print(f"Login failed before extraction: {login_res.get('error')}")
+
         self.total_videos = 0
         self.total_pdfs = 0
         self.raw_links = []
