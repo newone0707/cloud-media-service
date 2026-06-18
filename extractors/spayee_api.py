@@ -75,12 +75,79 @@ class SpayeeClient:
         except Exception as e:
             return {"success": False, "error": f"Login request failed: {e}"}
 
+    async def _login_playwright(self):
+        """Robust headless Playwright login that captures session_id and jwt token"""
+        if not self.email or not self.password or self.email.lower() in ['token', 'cookie']:
+            return {"success": False, "error": "Invalid credentials format"}
+            
+        print("Starting headless Playwright login flow...")
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox'
+                    ]
+                )
+                context = await browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    viewport={'width': 1280, 'height': 900}
+                )
+                page = await context.new_page()
+                
+                url = f"{self.domain_url}/s/authenticate"
+                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                
+                print("Waiting for login iframe to be attached...")
+                await page.wait_for_selector('iframe[src*="public/login"]', timeout=30000)
+                frame = page.frame_locator('iframe[src*="public/login"]')
+                
+                print("Clicking 'Continue with email'...")
+                email_btn = frame.locator('button[title="Continue with email"]')
+                await email_btn.click(timeout=30000)
+                
+                print("Filling credentials...")
+                await frame.locator('input[name="email"]').fill(self.email, timeout=10000)
+                await frame.locator('input[name="password"]').fill(self.password, timeout=10000)
+                
+                print("Clicking submit...")
+                await frame.locator('button[type="submit"]').click(timeout=10000)
+                
+                session_id = None
+                token = None
+                print("Polling for cookies...")
+                for i in range(30):
+                    await page.wait_for_timeout(1000)
+                    cookies = await context.cookies()
+                    session_id = next((c['value'] for c in cookies if c['name'] == 'SESSIONID'), None)
+                    token = next((c['value'] for c in cookies if c['name'] == 'c_ujwt' or c['name'] == 'jwt'), None)
+                    if session_id and token:
+                        print(f"Found cookies on poll {i+1}!")
+                        break
+                        
+                await browser.close()
+                
+                if session_id and token:
+                    self.session_id = session_id
+                    self.token = token
+                    print(f"Playwright login successful! SESSIONID: {self.session_id[:10]}..., JWT: {self.token[:10]}...")
+                    return {"success": True}
+                else:
+                    return {"success": False, "error": f"Failed to retrieve cookies. SESSIONID: {session_id}, JWT: {token}"}
+        except Exception as e:
+            print(f"Playwright login exception: {e}")
+            return {"success": False, "error": f"Playwright login exception: {e}"}
+
     async def fetch_courses(self):
         try:
             if not getattr(self, 'session_id', None) or not getattr(self, 'token', None):
-                login_res = self._login_api()
+                login_res = await self._login_playwright()
                 if not login_res.get("success"):
-                    return {"success": False, "error": login_res.get("error", "Login failed")}
+                    login_res = self._login_api()
+                    if not login_res.get("success"):
+                        return {"success": False, "error": login_res.get("error", "Login failed")}
             
             api_result = await self._fetch_courses_api()
             if api_result.get("success"):
@@ -193,10 +260,12 @@ class SpayeeClient:
 
     async def extract_links(self, course_id):
         """Extract video/PDF links from a course page"""
-        if not getattr(self, 'session_id', None) or not getattr(self, 'token', None):
-            login_res = self._login_api()
+        if not getattr(self, 'session_id', None):
+            login_res = await self._login_playwright()
             if not login_res.get("success"):
-                print(f"Login failed before extraction: {login_res.get('error')}")
+                login_res = self._login_api()
+                if not login_res.get("success"):
+                    print(f"Login failed before extraction: {login_res.get('error')}")
 
         self.total_videos = 0
         self.total_pdfs = 0
@@ -289,7 +358,7 @@ class SpayeeClient:
                         
                         full_title = f"({chapter_title}) {item_title}" if chapter_title else item_title
                         
-                        if item_type == "label" and "items" in item:
+                        if "items" in item:
                             await process_items(item["items"], item_title)
                             
                         elif item_type == "video":
@@ -304,6 +373,7 @@ class SpayeeClient:
                                     resource = vdata.get("spayee:resource", {})
                                     stream_url = resource.get("spayee:streamUrl")
                                     if stream_url:
+                                        self.total_videos += 1
                                         token_val = self.token if getattr(self, 'token', None) else 'NO_TOKEN'
                                         
                                         key_b64 = ""
