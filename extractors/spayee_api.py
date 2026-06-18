@@ -296,10 +296,24 @@ class SpayeeClient:
                                     resource = vdata.get("spayee:resource", {})
                                     stream_url = resource.get("spayee:streamUrl")
                                     if stream_url:
-                                        self.total_videos += 1
-                                        suffix = f"*{uuid.uuid4()}"
-                                        formatted_links.append(f"{full_title} : {stream_url}{suffix}")
+                                        token_val = self.token if getattr(self, 'token', None) else 'NO_TOKEN'
                                         
+                                        key_b64 = ""
+                                        try:
+                                            key_url = stream_url.split('?')[0].rsplit('/', 1)[0] + '/k/timestamp'
+                                            async with session.get(key_url, headers=headers) as kresp:
+                                                if kresp.status == 200:
+                                                    kblob = await kresp.read()
+                                                    if len(kblob) == 64:
+                                                        import base64
+                                                        key_b64 = base64.b64encode(kblob).decode('utf-8')
+                                        except:
+                                            pass
+                                            
+                                        suffix = f"*{token_val}"
+                                        if key_b64:
+                                            suffix += f"*{key_b64}"
+                                        formatted_links.append(f"{full_title} : {stream_url}{suffix}")
                         elif item_type == "pdf":
                             # Fetch PDF URL
                             p_url = f"{self.domain_url}/s/courses/{course_obj_id}/pdfs/{item_id}/preview/url"
@@ -309,7 +323,23 @@ class SpayeeClient:
                                     pdf_url = pdata.get("url")
                                     if pdf_url:
                                         self.total_pdfs += 1
-                                        suffix = f"*{uuid.uuid4()}"
+                                        token_val = self.token if getattr(self, 'token', None) else 'NO_TOKEN'
+                                        
+                                        key_b64 = ""
+                                        try:
+                                            key_url = pdf_url.split('?')[0].rsplit('/', 1)[0] + '/k/timestamp'
+                                            async with session.get(key_url, headers=headers) as kresp:
+                                                if kresp.status == 200:
+                                                    kblob = await kresp.read()
+                                                    if len(kblob) == 64:
+                                                        import base64
+                                                        key_b64 = base64.b64encode(kblob).decode('utf-8')
+                                        except:
+                                            pass
+                                            
+                                        suffix = f"*{token_val}"
+                                        if key_b64:
+                                            suffix += f"*{key_b64}"
                                         formatted_links.append(f"{full_title} : {pdf_url}{suffix}")
                 
                 await process_items(toc_data["toc"], "")
