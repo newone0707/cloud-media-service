@@ -44,20 +44,51 @@ class SpayeeClient:
         self.session_id = self.cookie_dict.get("SESSIONID")
         self.token = self.cookie_dict.get("c_ujwt") or self.cookie_dict.get("jwt")
         
+    def _login_api(self):
+        """Pure backend requests login to bypass Playwright and Cloudflare blocks"""
+        if not self.email or not self.password or self.email.lower() in ['token', 'cookie']:
+            return {"success": False, "error": "Invalid credentials format"}
+            
+        try:
+            session = requests.Session()
+            url = f"{self.domain_url}/s/authenticate"
+            data = {
+                'email': self.email,
+                'password': self.password,
+                'age': '',
+                'url': '/s/authenticate'
+            }
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            r = session.post(url, data=data, headers=headers, allow_redirects=False, timeout=15)
+            
+            cookies = session.cookies.get_dict()
+            if 'c_ujwt' in cookies:
+                self.token = cookies['c_ujwt']
+                self.session_id = cookies.get('SESSIONID')
+                return {"success": True}
+            elif r.status_code == 200:
+                return {"success": False, "error": "Invalid email or password"}
+            else:
+                return {"success": False, "error": f"Login returned status {r.status_code}"}
+        except Exception as e:
+            return {"success": False, "error": f"Login request failed: {e}"}
+
     async def fetch_courses(self):
         try:
-            if getattr(self, 'session_id', None) and getattr(self, 'token', None):
-                # Try API fetch first if cookies exist
-                api_result = await self._fetch_courses_api()
-                if api_result.get("success"):
-                    return api_result
-                    
-            # ONLY use Playwright-based scraping to get the ACTUAL enrolled courses
-            # Store scraping gets junk public courses that the user isn't enrolled in.
-            return await self._fetch_courses_playwright()
+            if not getattr(self, 'session_id', None) or not getattr(self, 'token', None):
+                login_res = self._login_api()
+                if not login_res.get("success"):
+                    return {"success": False, "error": login_res.get("error", "Login failed")}
+            
+            api_result = await self._fetch_courses_api()
+            if api_result.get("success"):
+                return api_result
+            return {"success": False, "error": "No courses found"}
         except Exception as e:
             return {"success": False, "error": str(e)}
-    
+
     def _fetch_courses_from_store(self):
         """Fetch courses from the public store page using requests (fast, no browser needed)"""
         try:
@@ -72,7 +103,6 @@ class SpayeeClient:
             if self.session_id:
                 session.cookies.set("SESSIONID", self.session_id, domain=self.domain_host, path="/")
             
-            # Try store page
             r = session.get(f"{self.domain_url}/s/store", timeout=15)
             
             if r.status_code != 200:
@@ -81,7 +111,6 @@ class SpayeeClient:
             courses = []
             seen = set()
             
-            # Pattern 1: /courses/Title-CourseId (new Graphy URLs)
             matches = re.findall(r'href="(https?://[^"]*?/courses/([^"]+)-([a-f0-9]{24}))"', r.text)
             for full_url, title_slug, course_id in matches:
                 if course_id not in seen:
@@ -89,13 +118,11 @@ class SpayeeClient:
                     title = unquote(title_slug).replace('-', ' ')
                     courses.append({"id": full_url, "title": title})
             
-            # Pattern 2: /s/store/courses/CategoryName (category pages)
             cat_matches = re.findall(r'href="(https?://[^"]*?/s/store/courses/([^"]+))"', r.text)
             for full_url, cat_name in cat_matches:
                 cat_name_decoded = unquote(cat_name)
                 if cat_name_decoded not in seen and not cat_name_decoded.startswith('<'):
                     seen.add(cat_name_decoded)
-                    # Fetch category page for individual courses
                     try:
                         cr = session.get(full_url, timeout=10)
                         cat_courses = re.findall(r'href="(https?://[^"]*?/courses/([^"]+)-([a-f0-9]{24}))"', cr.text)
@@ -106,7 +133,6 @@ class SpayeeClient:
                     except:
                         pass
             
-            # Pattern 3: /s/store/content/CourseId
             content_matches = re.findall(r'/s/store/content/([a-f0-9]{24})', r.text)
             for cid in content_matches:
                 if cid not in seen:
@@ -118,130 +144,6 @@ class SpayeeClient:
         except Exception as e:
             print(f"Store fetch error: {e}")
             return []
-    
-    async def _fetch_courses_playwright(self):
-        """Fallback: use Playwright to scrape courses page"""
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-                ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                context = await browser.new_context(user_agent=ua)
-                
-                cookies = []
-                if self.token:
-                    cookies.append({"name": "jwt", "value": self.token, "domain": self.domain_host, "path": "/"})
-                    cookies.append({"name": "c_ujwt", "value": self.token, "domain": self.domain_host, "path": "/"})
-                if self.session_id:
-                    cookies.append({"name": "SESSIONID", "value": self.session_id, "domain": self.domain_host, "path": "/"})
-                if cookies:
-                    await context.add_cookies(cookies)
-                
-                page = await context.new_page()
-                
-                if not self.token and not self.session_id:
-                    # Try email/password login
-                    login_url = f"{self.domain_url}/s/authenticate"
-                    await page.goto(login_url, wait_until="domcontentloaded")
-                    
-                    email_sel = 'input[type="email"], input[name="email"], #email'
-                    pass_sel = 'input[type="password"], input[name="password"], #password'
-                    btn_sel = 'button[type="submit"], #login-btn, .login-btn'
-                    
-                    try:
-                        await page.wait_for_selector(email_sel, timeout=5000)
-                        await page.fill(email_sel, self.email)
-                        await page.fill(pass_sel, self.password)
-                        await page.click(btn_sel)
-                    except:
-                        try:
-                            iframe = page.frame_locator('iframe#microfe-popup-login, iframe[src*="login"]')
-                            
-                            # Try the Graphy 2-step flow first: name="identifier" -> Continue -> name="password" -> Continue
-                            try:
-                                identifier_input = iframe.locator('input[name="identifier"], input#input-identifier').first
-                                await identifier_input.wait_for(state="visible", timeout=5000)
-                                await identifier_input.fill(self.email)
-                                await iframe.locator('button[type="submit"]').first.click()
-                                await asyncio.sleep(2)
-                                
-                                pass_input = iframe.locator('input[name="password"], input[type="password"]').first
-                                await pass_input.wait_for(state="visible", timeout=5000)
-                                await pass_input.fill(self.password)
-                                await iframe.locator('button[type="submit"]').first.click()
-                            except:
-                                # Fallback to standard 1-step or standard email toggle
-                                try:
-                                    email_toggle = iframe.locator('text="Email", text="Continue with Email", text="Login with Email"').first
-                                    await email_toggle.wait_for(state="visible", timeout=3000)
-                                    await email_toggle.click()
-                                    await asyncio.sleep(2)
-                                except:
-                                    pass
-                                    
-                                await iframe.locator(email_sel).first.wait_for(state="attached", timeout=10000)
-                                await iframe.locator(email_sel).first.fill(self.email)
-                                await iframe.locator(pass_sel).first.fill(self.password)
-                                await iframe.locator(btn_sel).first.click()
-                        except:
-                            await browser.close()
-                            return {"success": False, "error": f"Login failed. Try: {self.domain_url} token*<your_c_ujwt_cookie>"}
-                    await asyncio.sleep(5)
-                
-                js_eval = '''() => {
-                    let root = document.querySelector('main') || document.querySelector('.dashboard-container') || document.querySelector('.my-courses') || document;
-                    const links = Array.from(root.querySelectorAll('a'));
-                    
-                    const validLinks = links.filter(a => {
-                        let parent = a.parentElement;
-                        while(parent && parent !== document.body) {
-                            if (parent.tagName === 'NAV' || parent.tagName === 'HEADER' || parent.tagName === 'FOOTER' || parent.id.toLowerCase().includes('header') || parent.className.toLowerCase().includes('header')) return false;
-                            parent = parent.parentElement;
-                        }
-                        return true;
-                    });
-
-                    const courseLinks = validLinks.filter(a => 
-                        a.href.includes('/s/store/courses/') || 
-                        a.href.includes('/courses/') ||
-                        a.href.includes('/course/') ||
-                        a.href.includes('/products/') ||
-                        a.href.includes('/t/c/')
-                    );
-                    
-                    const unique = [];
-                    const seen = new Set();
-                    courseLinks.forEach(a => {
-                        // ignore pure fragment or javascript links
-                        if (a.href.includes('javascript:') || a.getAttribute('href') === '#') return;
-                        if (!seen.has(a.href)) {
-                            seen.add(a.href);
-                            let title = a.innerText.trim();
-                            if (!title) { const img = a.querySelector('img'); if (img && img.alt) title = img.alt; }
-                            if (!title) title = "Course";
-                            if (title.length > 3) unique.push({id: a.href, title: title});
-                        }
-                    });
-                    return unique;
-                }'''
-                
-                # Try multiple pages
-                for url_path in ["/s/mycourses", "/t/u/activeCourses"]:
-                    try:
-                        await page.goto(f"{self.domain_url}{url_path}", wait_until="domcontentloaded", timeout=15000)
-                        await asyncio.sleep(5)
-                        courses_dict = await page.evaluate(js_eval)
-                        if courses_dict:
-                            await browser.close()
-                            self.courses = courses_dict
-                            return {"success": True, "courses": courses_dict}
-                    except:
-                        continue
-                
-                await browser.close()
-                return {"success": False, "error": "No courses found. Try: URL token*<your_c_ujwt_cookie_value>"}
-                
-        except Exception as e:
-            return {"success": False, "error": str(e)}
 
     async def _fetch_courses_api(self):
         """Fetch courses using the internal API directly if cookies are present"""
