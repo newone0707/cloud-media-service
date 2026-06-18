@@ -46,6 +46,12 @@ class SpayeeClient:
         
     async def fetch_courses(self):
         try:
+            if getattr(self, 'session_id', None) and getattr(self, 'token', None):
+                # Try API fetch first if cookies exist
+                api_result = await self._fetch_courses_api()
+                if api_result.get("success"):
+                    return api_result
+                    
             # ONLY use Playwright-based scraping to get the ACTUAL enrolled courses
             # Store scraping gets junk public courses that the user isn't enrolled in.
             return await self._fetch_courses_playwright()
@@ -149,10 +155,33 @@ class SpayeeClient:
                     except:
                         try:
                             iframe = page.frame_locator('iframe#microfe-popup-login, iframe[src*="login"]')
-                            await iframe.locator(email_sel).first.wait_for(state="attached", timeout=15000)
-                            await iframe.locator(email_sel).first.fill(self.email)
-                            await iframe.locator(pass_sel).first.fill(self.password)
-                            await iframe.locator(btn_sel).first.click()
+                            
+                            # Try the Graphy 2-step flow first: name="identifier" -> Continue -> name="password" -> Continue
+                            try:
+                                identifier_input = iframe.locator('input[name="identifier"], input#input-identifier').first
+                                await identifier_input.wait_for(state="visible", timeout=5000)
+                                await identifier_input.fill(self.email)
+                                await iframe.locator('button[type="submit"]').first.click()
+                                await asyncio.sleep(2)
+                                
+                                pass_input = iframe.locator('input[name="password"], input[type="password"]').first
+                                await pass_input.wait_for(state="visible", timeout=5000)
+                                await pass_input.fill(self.password)
+                                await iframe.locator('button[type="submit"]').first.click()
+                            except:
+                                # Fallback to standard 1-step or standard email toggle
+                                try:
+                                    email_toggle = iframe.locator('text="Email", text="Continue with Email", text="Login with Email"').first
+                                    await email_toggle.wait_for(state="visible", timeout=3000)
+                                    await email_toggle.click()
+                                    await asyncio.sleep(2)
+                                except:
+                                    pass
+                                    
+                                await iframe.locator(email_sel).first.wait_for(state="attached", timeout=10000)
+                                await iframe.locator(email_sel).first.fill(self.email)
+                                await iframe.locator(pass_sel).first.fill(self.password)
+                                await iframe.locator(btn_sel).first.click()
                         except:
                             await browser.close()
                             return {"success": False, "error": f"Login failed. Try: {self.domain_url} token*<your_c_ujwt_cookie>"}
@@ -196,7 +225,7 @@ class SpayeeClient:
                 }'''
                 
                 # Try multiple pages
-                for url_path in ["/s/mycourses", "/t/u/activeCourses", "/s/store"]:
+                for url_path in ["/s/mycourses", "/t/u/activeCourses"]:
                     try:
                         await page.goto(f"{self.domain_url}{url_path}", wait_until="domcontentloaded", timeout=15000)
                         await asyncio.sleep(5)
@@ -214,6 +243,52 @@ class SpayeeClient:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    async def _fetch_courses_api(self):
+        """Fetch courses using the internal API directly if cookies are present"""
+        import aiohttp
+        url = f"{self.domain_url}/s/mycourses/get?skip=0&limit=100&queryData=%7B%7D&isVerticalFilters=true&categoryLevel=0&archived=false"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
+        
+        # Build cookies
+        cookies = {}
+        if self.token:
+            cookies["jwt"] = self.token
+            cookies["c_ujwt"] = self.token
+        if self.session_id:
+            cookies["SESSIONID"] = self.session_id
+            
+        try:
+            async with aiohttp.ClientSession(cookies=cookies) as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        return {"success": False, "error": f"API returned {response.status}. Session expired or invalid cookies."}
+                    data = await response.json()
+                    
+                    if "data" not in data or "data" not in data["data"]:
+                        return {"success": False, "error": "Unexpected API response format."}
+                        
+                    unique = []
+                    for item in data["data"]["data"]:
+                        res_data = item.get("spayee:resource", {})
+                        title = res_data.get("spayee:title", "Course")
+                        course_url_slug = res_data.get("spayee:courseUrl", item.get("_id"))
+                        # Construct link with ID appended so extract_links can use it
+                        course_id = item.get("_id")
+                        link = f"{self.domain_url}/s/store/courses/description/{course_url_slug}?id={course_id}"
+                        unique.append({"id": link, "title": title})
+                    
+                    if not unique:
+                        return {"success": False, "error": "No enrolled courses found in API response."}
+                        
+                    self.courses = unique
+                    return {"success": True, "courses": unique}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     async def extract_links(self, course_id):
         """Extract video/PDF links from a course page"""
         self.total_videos = 0
@@ -223,234 +298,121 @@ class SpayeeClient:
         self.id_map = {}
         
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-                ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                context = await browser.new_context(user_agent=ua)
-                
-                cookies = []
-                if getattr(self, 'token', None):
-                    cookies.append({"name": "jwt", "value": self.token, "domain": self.domain_host, "path": "/"})
-                    cookies.append({"name": "c_ujwt", "value": self.token, "domain": self.domain_host, "path": "/"})
-                if getattr(self, 'session_id', None):
-                    cookies.append({"name": "SESSIONID", "value": self.session_id, "domain": self.domain_host, "path": "/"})
-                if cookies:
-                    await context.add_cookies(cookies)
-                
-                page = await context.new_page()
-                
-                if not getattr(self, 'token', None) and not getattr(self, 'session_id', None):
-                    login_url = f"{self.domain_url}/s/authenticate"
-                    await page.goto(login_url, wait_until="domcontentloaded")
-                    email_sel = 'input[type="email"], input[name="email"], #email'
-                    pass_sel = 'input[type="password"], input[name="password"], #password'
-                    btn_sel = 'button[type="submit"], #login-btn, .login-btn'
-                    try:
-                        await page.wait_for_selector(email_sel, timeout=5000)
-                        await page.fill(email_sel, self.email)
-                        await page.fill(pass_sel, self.password)
-                        await page.click(btn_sel)
-                    except:
-                        try:
-                            iframe = page.frame_locator('iframe#microfe-popup-login, iframe[src*="login"]')
-                            await iframe.locator(email_sel).first.wait_for(state="attached", timeout=15000)
-                            await iframe.locator(email_sel).first.fill(self.email)
-                            await iframe.locator(pass_sel).first.fill(self.password)
-                            await iframe.locator(btn_sel).first.click()
-                        except:
-                            pass
-                    await asyncio.sleep(5)
-                
-                def _is_content_url(u):
-                    if not isinstance(u, str): return False
-                    return ("cloudfront.net" in u or "spayee" in u or ".m3u8" in u or ".pdf" in u)
-                
-                def _is_junk(u):
-                    if not isinstance(u, str): return False
-                    return any(ext in u.lower() for ext in ['.jpg', '.png', '.jpeg', '.css', '.woff', '.ttf', '.js', '.ts', '.svg', '.ico'])
-                
-                def _extract_titles(data, current_chapter=""):
-                    if isinstance(data, dict):
-                        title = data.get('title') or data.get('chapterTitle') or data.get('name') or data.get('spayee:title') or ""
-                        if 'spayee:resource' in data:
-                            title = data['spayee:resource'].get('spayee:title', title)
-                            
-                        # If this has items/children, it's probably a chapter
-                        has_children = 'items' in data or 'resources' in data or 'children' in data
-                        new_chapter = title if has_children and title else current_chapter
-                        
-                        item_id = data.get('id') or data.get('_id') or data.get('spayee:id') or data.get('resourceId')
-                        if 'spayee:resource' in data:
-                            item_id = data['spayee:resource'].get('spayee:id', item_id)
-                            
-                        # Extract URLs
-                        url = None
-                        for k in ['url', 'contentUrl', 'drmUrl', 'fileUrl', 'videoUrl', 'pdfUrl', 'spayee:url', 'spayee:hlsUrl']:
-                            v = data.get(k)
-                            if _is_content_url(v):
-                                url = v
-                                break
-                        if 'spayee:resource' in data:
-                            for k in ['spayee:url', 'spayee:hlsUrl', 'spayee:pdfUrl']:
-                                v = data['spayee:resource'].get(k)
-                                if _is_content_url(v):
-                                    url = v
-                                    break
-                                    
-                        # Save mapping
-                        full_title = f"({new_chapter}) {title}" if new_chapter else title
-                        if not full_title.strip():
-                            full_title = "Item"
-                        if url and not _is_junk(url):
-                            if url not in self.raw_links:
-                                self.raw_links.append(url)
-                            self.title_map[url] = full_title
-                            if item_id:
-                                self.id_map[url] = item_id
-                        if item_id and title:
-                            self.title_map[item_id] = full_title
-                            
-                        for v in data.values():
-                            _extract_titles(v, new_chapter)
-                            
-                    elif isinstance(data, list):
-                        for item in data:
-                            _extract_titles(item, current_chapter)
-
-                async def handle_request(request):
-                    try:
-                        u = request.url
-                        if _is_content_url(u) and not _is_junk(u):
-                            if u not in self.raw_links:
-                                self.raw_links.append(u)
-                    except:
-                        pass
-                page.on("request", handle_request)
-                
-                async def handle_response(response):
-                    try:
-                        ct = response.headers.get("content-type", "")
-                        if "application/json" in ct:
-                            text = await response.text()
-                            
-                            # Parse JSON to map titles
-                            try:
-                                data = json.loads(text)
-                                _extract_titles(data)
-                            except:
-                                pass
-                                
-                            urls = re.findall(r'https?://[^\s\'"<>]+', text)
-                            for u in urls:
-                                if _is_content_url(u) and not _is_junk(u):
-                                    if u not in self.raw_links:
-                                        self.raw_links.append(u)
-                    except:
-                        pass
-                page.on("response", handle_response)
-                
-                # Navigate to course page
-                try:
-                    await page.goto(course_id, wait_until="domcontentloaded", timeout=30000)
-                except Exception as e:
-                    print(f"Goto timeout/error caught: {e}")
-                    pass
+            import aiohttp
+            import uuid
+            
+            # The course_id is either passed as a slug or ID. But since we modified _fetch_courses_api,
+            # it might be the slug if it's the old format, or the ID.
+            # If the user gives a URL like /s/store/courses/description/xyz, we need the course_id.
+            # We can get courseId by fetching the description page and finding `courseId: "..."`.
+            
+            course_obj_id = course_id
+            if "id=" in course_id:
+                m = re.search(r'id=([a-f0-9]{24})', course_id)
+                if m:
+                    course_obj_id = m.group(1)
+            elif "ganitank.com" in course_id or "description" in course_id:
+                # Need to extract course ID. The HTML description page requires auth and doesn't contain the ID.
+                # Let's map the slug back using the user's enrolled courses API.
+                m = re.search(r'/description/([^?]+)', course_id)
+                if m:
+                    slug = m.group(1)
+                    # fetch from API
+                    import aiohttp
+                    api_url = f"{self.domain_url}/s/mycourses/get?skip=0&limit=100&queryData=%7B%7D"
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "application/json"
+                    }
+                    cookies = {}
+                    if getattr(self, 'token', None):
+                        cookies["jwt"] = self.token
+                        cookies["c_ujwt"] = self.token
+                    if getattr(self, 'session_id', None):
+                        cookies["SESSIONID"] = self.session_id
                     
-                await asyncio.sleep(5) # Initial load wait
+                    async with aiohttp.ClientSession(cookies=cookies) as session:
+                        async with session.get(api_url, headers=headers) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                for item in data.get("data", {}).get("data", []):
+                                    if item.get("spayee:resource", {}).get("spayee:courseUrl") == slug:
+                                        course_obj_id = item.get("_id")
+                                        break
+                                        
+                if course_obj_id == course_id:
+                    # failed to map
+                    return []
+            else:
+                # If it's a URL, extract the ID
+                m = re.search(r'([a-f0-9]{24})', course_id)
+                if m:
+                    course_obj_id = m.group(1)
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json"
+            }
+            cookies = {}
+            if getattr(self, 'token', None):
+                cookies["jwt"] = self.token
+                cookies["c_ujwt"] = self.token
+            if getattr(self, 'session_id', None):
+                cookies["SESSIONID"] = self.session_id
                 
-                # If we are on a store page, we must click "Continue Learning" to reach the player where the curriculum is
-                try:
-                    continue_btn = await page.query_selector('.btn-continue, a[href*="/player/"], a[href*="/t/c/"], button:has-text("Continue")')
-                    if continue_btn:
-                        print("Found Continue Learning button! Clicking it to reach player...")
-                        await continue_btn.click()
-                        await asyncio.sleep(10) # Wait for player to load
-                except Exception as e:
-                    print(f"Error clicking continue: {e}")
+            async with aiohttp.ClientSession(cookies=cookies) as session:
+                # Fetch TOC
+                toc_url = f"{self.domain_url}/s/store/course/{course_obj_id}/toc"
+                async with session.get(toc_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        return []
+                    toc_data = await resp.json()
                     
-                await asyncio.sleep(10) # Wait for curriculum JSONs to finish loading
-                
-                try:
-                    # Try to trigger dynamic loads by scrolling
-                    await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                except:
-                    pass
-                await asyncio.sleep(5)
-                
-                # Also scrape HTML content for URLs and JSON strings
-                page_content = await page.content()
-                
-                # Try to find JSON embedded in scripts
-                scripts = re.findall(r'<script[^>]*>(.*?)</script>', page_content, re.DOTALL)
-                for script in scripts:
-                    try:
-                        # naive JSON extraction
-                        json_strs = re.findall(r'\{.*\}', script)
-                        for js_str in json_strs:
-                            try:
-                                data = json.loads(js_str)
-                                _extract_titles(data)
-                            except:
-                                pass
-                    except:
-                        pass
-                
-                urls = re.findall(r'https?://[^\s\'"<>]+', page_content)
-                for u in urls:
-                    if _is_content_url(u) and not _is_junk(u):
-                        if u not in self.raw_links:
-                            self.raw_links.append(u)
-                                    
-                await browser.close()
-                
-                # Format output
+                if "toc" not in toc_data:
+                    return []
+                    
                 formatted_links = []
-                for link in self.raw_links:
-                    name = self.title_map.get(link)
-                    
-                    # If name not directly mapped by URL, try to map by ID in the URL
-                    if not name:
-                        for k, v in self.title_map.items():
-                            if str(k) in link and len(str(k)) > 10:
-                                name = v
-                                break
-                    
-                    if not name:
-                        name = "Document PDF" if ".pdf" in link else "Video File"
-                    
-                    # Check if we should append *ID
-                    suffix = ""
-                    mapped_id = self.id_map.get(link)
-                    if mapped_id:
-                        suffix = f"*{mapped_id}"
-                    else:
-                        # try to find uuid in link
-                        m = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', link)
-                        if m:
-                            suffix = f"*{m.group(1)}"
-                            # Clean the UUID from the link itself if it's not a parameter
-                            if f"*{m.group(1)}" not in link:
-                                pass
-                        else:
-                            # maybe the 24-char hex id
-                            m = re.search(r'([a-f0-9]{24})', link)
-                            if m:
-                                suffix = f"*{m.group(1)}"
-
-                    # If the link already contains *, don't add it again
-                    if "*" in link:
-                        final_url = link
-                    else:
-                        final_url = f"{link}{suffix}"
+                
+                # Helper to traverse TOC
+                async def process_items(items, chapter_title):
+                    for item in items:
+                        item_type = item.get("type", "")
+                        item_id = item.get("id", "")
+                        item_title = item.get("title", "Item")
                         
-                    formatted_links.append(f"{name} : {final_url}")
-                    
-                    if ".pdf" in link:
-                        self.total_pdfs += 1
-                    else:
-                        self.total_videos += 1
-                    
-                # Deduplicate by final URL
+                        full_title = f"({chapter_title}) {item_title}" if chapter_title else item_title
+                        
+                        if item_type == "label" and "items" in item:
+                            await process_items(item["items"], item_title)
+                            
+                        elif item_type == "video":
+                            # Fetch video URL
+                            v_url = f"{self.domain_url}/s/courses/{course_obj_id}/videos/{item_id}/get"
+                            async with session.get(v_url, headers=headers) as vresp:
+                                if vresp.status == 200:
+                                    vdata = await vresp.json()
+                                    resource = vdata.get("spayee:resource", {})
+                                    stream_url = resource.get("spayee:streamUrl")
+                                    if stream_url:
+                                        self.total_videos += 1
+                                        suffix = f"*{uuid.uuid4()}"
+                                        formatted_links.append(f"{full_title} : {stream_url}{suffix}")
+                                        
+                        elif item_type == "pdf":
+                            # Fetch PDF URL
+                            p_url = f"{self.domain_url}/s/courses/{course_obj_id}/pdfs/{item_id}/preview/url"
+                            async with session.get(p_url, headers=headers) as presp:
+                                if presp.status == 200:
+                                    pdata = await presp.json()
+                                    pdf_url = pdata.get("url")
+                                    if pdf_url:
+                                        self.total_pdfs += 1
+                                        suffix = f"*{uuid.uuid4()}"
+                                        formatted_links.append(f"{full_title} : {pdf_url}{suffix}")
+                
+                await process_items(toc_data["toc"], "")
+                
+                # Deduplicate
                 unique_links = []
                 seen = set()
                 for flink in formatted_links:
@@ -459,6 +421,7 @@ class SpayeeClient:
                         unique_links.append(flink)
                         
                 return unique_links
+                
         except Exception as e:
             print(f"Extraction error: {e}")
             return []
