@@ -292,6 +292,9 @@ class SpayeeClient:
                             v_url = f"{self.domain_url}/s/courses/{course_obj_id}/videos/{item_id}/get"
                             async with session.get(v_url, headers=headers) as vresp:
                                 if vresp.status == 200:
+                                    if 'application/json' not in vresp.headers.get('Content-Type', ''):
+                                        print('Session expired or invalid for Spayee, got HTML instead of JSON.')
+                                        continue
                                     vdata = await vresp.json()
                                     resource = vdata.get("spayee:resource", {})
                                     stream_url = resource.get("spayee:streamUrl")
@@ -319,6 +322,8 @@ class SpayeeClient:
                             p_url = f"{self.domain_url}/s/courses/{course_obj_id}/pdfs/{item_id}/preview/url"
                             async with session.get(p_url, headers=headers) as presp:
                                 if presp.status == 200:
+                                    if 'application/json' not in presp.headers.get('Content-Type', ''):
+                                        continue
                                     pdata = await presp.json()
                                     pdf_url = pdata.get("url")
                                     if pdf_url:
